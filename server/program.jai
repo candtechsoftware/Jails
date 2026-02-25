@@ -309,6 +309,41 @@ node_visit :: (node: *Node, data: Node_Visit_Data) {
     }
 }
 
+parse_local_module_files :: () {
+    for local_module: server.local_modules {
+        local_module_path: string;
+        if is_absolute_path(local_module) {
+            local_module_path = local_module;
+        } else {
+            local_module_path = join(server.project_root, local_module, separator="/");
+        }
+
+        jai_files: [..]string;
+        visit_files(local_module_path, true, *jai_files, (info: *File_Visit_Info, jai_files: *[..]string) {
+            if info.is_directory return;
+            if !contains(info.short_name, ".jai") return;
+            array_add(jai_files, copy_string(info.full_name));
+        }, visit_directories=true);
+
+        for file_path: jai_files {
+            parse_file(file_path);  // no-op if already parsed
+        }
+    }
+}
+
+is_project_local_module_file :: (file: *Program_File) -> bool {
+    for local_module: server.local_modules {
+        full_path: string;
+        if is_absolute_path(local_module) {
+            full_path = tprint("%/", local_module);
+        } else {
+            full_path = tprint("%/%/", server.project_root, local_module);
+        }
+        if begins_with(file.path, full_path) return true;
+    }
+    return false;
+}
+
 get_module_import_path :: (_import: *Directive_Import, current_path: string) -> string {
 
     get_module_entry :: (module: string) -> string {
@@ -436,8 +471,20 @@ get_file_links :: (file: *Program_File) -> [..]Linked_File {
 
             if !is_avaiable_from_one_of_the_parents {
                 avaiable, from_import= := is_avaiable_from(file, it.path, *already_checked);
-                if !avaiable continue;
+                if avaiable {
+                    is_avaiable_from_one_of_the_parents = true;
+                }
             }
+
+            // For files in local modules, also check if target is a project file
+            if !is_avaiable_from_one_of_the_parents {
+                if is_project_local_module_file(file) && begins_with(it.path, server.project_root) {
+                    is_avaiable_from_one_of_the_parents = true;
+                    from_import = true;
+                }
+            }
+
+            if !is_avaiable_from_one_of_the_parents continue;
         }
 
         array_add(*linked_files, .{ file=it, from_import=from_import });

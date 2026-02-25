@@ -340,6 +340,7 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
                 parse_file(tprint("%/modules/Preload.jai", server.args.jai_path), true);
             }
 
+            parse_local_module_files();
 
             analyze_files();
 
