@@ -27,6 +27,7 @@ Server :: struct {
     project_root: string;
     files: Table(string, *Program_File);
     files_to_be_analyzed: [..]*Program_File;
+    reverse_load_map: Table(string, string); // loaded_file_path -> loading_file_path (multi-map)
 
     memory_files_lock: Mutex;
     memory_files: Table(string, [..]u8); // @todo: This is probably dumb - store files as array of lines instead (is this good idea?) // @ToDo: Keep track of a modified flag per file
@@ -342,10 +343,14 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
 
             parse_local_module_files();
 
+            build_reverse_load_map();
+
             analyze_files();
 
             to_send: LSP_Result_Initialize;
             lsp_respond(body.id, to_send);
+
+            register_file_watcher();
 
         case "textDocument/definition";
             success, body := json_parse_string(raw_request, LSP_Request_Message_Definition,, temp);
@@ -383,7 +388,8 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
 
             create_memory_file(file_path, content);
 
-            parse_file(file_path);
+            ensure_file_context(file_path);
+            parse_file(file_path, true);
             analyze_files();
             run_diagnostics();
 
@@ -452,14 +458,48 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             handle_signature_help(body);
 
         case "textDocument/hover";
-            // success, body := json_parse_string(raw_request, LSP_Request_Message_Hover,, temp);
-            // if !success {
-            //     log_error("Unable to parse textDocument/completion message");
-            //     return;
-            // }
+            success, body := json_parse_string(raw_request, LSP_Request_Message_Hover,, temp);
+            if !success {
+                log_error("Unable to parse textDocument/hover message");
+                return;
+            }
 
-            // handle_hover(body);
+            handle_hover(body);
+
+        case "workspace/didChangeWatchedFiles";
+            success, body := json_parse_string(raw_request, LSP_Did_Change_Watched_Files,, temp);
+            if !success {
+                log_error("Unable to parse workspace/didChangeWatchedFiles message");
+                return;
+            }
+
+            for change: body.params.changes {
+                change_file_path := normalize_path(change.uri,, temp);
+
+                if change.type == 1 || change.type == 2 {  // Created or Changed
+                    parse_file(change_file_path, true);
+                }
+            }
+
+            build_reverse_load_map();
+            analyze_files();
     }
+}
+
+register_file_watcher :: () {
+    watcher := LSP_File_System_Watcher.{ globPattern = "**/*.jai", kind = 7 };
+
+    registration := LSP_Registration.{
+        id = "jails-file-watcher",
+        method = "workspace/didChangeWatchedFiles",
+        registerOptions = .{ watchers = .[watcher] }
+    };
+
+    request: LSP_Register_Capability_Request;
+    request.id = 1;
+    request.params.registrations = .[registration];
+
+    lsp_send(request);
 }
 
 main :: () {
@@ -486,6 +526,9 @@ main :: () {
 
     init(*server.files);
     defer deinit(*server.files);
+
+    init(*server.reverse_load_map);
+    defer deinit(*server.reverse_load_map);
 
     server.files_to_be_analyzed.allocator = context.default_allocator;
 

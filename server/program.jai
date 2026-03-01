@@ -1,3 +1,12 @@
+// Compile-time OS detection for filtering platform-conditional #load/#import
+#if OS == .WINDOWS {
+    JAILS_TARGET_OS :: "WINDOWS";
+} else #if OS == .MACOS {
+    JAILS_TARGET_OS :: "MACOS";
+} else {
+    JAILS_TARGET_OS :: "LINUX";
+}
+
 Module_Import :: struct {
     module: string;
     root: string;
@@ -181,6 +190,31 @@ parse_file :: (path: string, force := false) {
 
         file.global_block.members = parser.user_data.global_members;
         file.comments = parser.lexer.comments;
+
+        // Process deferred loads/imports now that all parent pointers are set.
+        // should_skip_for_os() can walk the full chain (Directive -> Case -> Block -> If).
+        for pending: parser.user_data.pending_loads {
+            if should_skip_for_os(pending.load) continue;
+            array_add(*file.loads, pending.load);
+            parse_file(pending.path);
+        }
+
+        for pending: parser.user_data.pending_imports {
+            if should_skip_for_os(pending.node) continue;
+
+            module_import: Module_Import;
+            module_import.root = pending.path;
+            module_import.module = pending.node.module;
+
+            if !pending.is_decl_import {
+                array_add(*file.imports, module_import);
+            }
+
+            parse_file(pending.path);
+        }
+
+        array_free(parser.user_data.pending_loads);
+        array_free(parser.user_data.pending_imports);
     }
 
     if content_from_file free(content);
@@ -240,11 +274,85 @@ analyze_files :: () {
     array_reset(*server.files_to_be_analyzed);
 }
 
+Pending_Load :: struct {
+    load: *Directive_Load;
+    path: string;
+}
+
+Pending_Import :: struct {
+    node: *Directive_Import;
+    path: string;
+    is_decl_import: bool;
+}
+
 Node_Visit_Data :: struct {
     file: *Program_File;
     global_members: [..]*Node;
     allocator: Allocator;
     path_without_filename: string;
+    pending_loads: [..]Pending_Load;
+    pending_imports: [..]Pending_Import;
+}
+
+// Check if a node (typically #load or #import) is inside a platform-conditional
+// case that doesn't match the current OS. Used to avoid loading wrong-platform files.
+//
+// Detects the pattern:  #if OS == { case .MACOS; #load "..."; }
+// Parent chain:         Directive_Load -> Case -> Block -> If
+should_skip_for_os :: (node: *Node) -> bool {
+    if !node.parent return false;
+
+    // Walk up to find a Case node (may pass through blocks)
+    case_node: *Case;
+    current := node.parent;
+    while current != null {
+        if current.kind == .CASE {
+            case_node = cast(*Case) current;
+            break;
+        }
+        if current.kind != .BLOCK break;
+        current = current.parent;
+    }
+
+    if !case_node return false;
+
+    // Walk up from Case to find the If node (Case -> Block -> If)
+    if_node: *If;
+    current = case_node.parent;
+    while current != null {
+        if current.kind == .IF {
+            if_node = cast(*If) current;
+            break;
+        }
+        if current.kind != .BLOCK break;
+        current = current.parent;
+    }
+
+    if !if_node return false;
+    if !if_node.compile_time return false;
+    if if_node.if_kind != .SWITCH return false;
+
+    // Check if the condition is `OS ==`
+    if !if_node.condition || if_node.condition.kind != .BINARY_OPERATION return false;
+    bin_op := cast(*Binary_Operation) if_node.condition;
+    if bin_op.operation != .IS_EQUAL return false;
+    if !bin_op.left || bin_op.left.kind != .IDENTIFIER return false;
+
+    condition_ident := cast(*Identifier) bin_op.left;
+    if condition_ident.name != "OS" return false;
+
+    // This IS an #if OS == { ... } pattern. Extract the case value.
+    if !case_node.expression return false;
+    if case_node.expression.kind != .UNARY_OPERATION return false;
+
+    unary := cast(*Unary_Operation) case_node.expression;
+    if unary.operation != .DOT return false;
+    if !unary.expression || unary.expression.kind != .IDENTIFIER return false;
+
+    os_name := (cast(*Identifier) unary.expression).name;
+
+    // Skip if the case OS doesn't match the current platform
+    return os_name != JAILS_TARGET_OS;
 }
 
 node_visit :: (node: *Node, data: Node_Visit_Data) {
@@ -283,24 +391,21 @@ node_visit :: (node: *Node, data: Node_Visit_Data) {
         _import := cast(*Directive_Import) node;
 
         path := get_module_import_path(_import, data.path_without_filename);
+        is_decl_import := _import.parent != null && _import.parent.kind == .DECLARATION;
 
-        module_import: Module_Import;
-        module_import.root = path;
-        module_import.module = _import.module;
-
-        if !_import.parent || _import.parent.kind != .DECLARATION {
-            array_add(*data.file.imports, module_import);
-        }
-
-        parse_file(path); // @TODO: Run this in another thread?
+        // Defer parse_file() until after the file is fully parsed so that all
+        // parent pointers are set and should_skip_for_os() can walk the full chain.
+        array_add(*data.pending_imports, .{ node = _import, path = path, is_decl_import = is_decl_import });
     }
 
     if node.kind == .DIRECTIVE_LOAD {
         _load := cast(*Directive_Load) node;
 
         load_relative_path := join(data.path_without_filename, _load.file, separator="/");
-        array_add(*data.file.loads, _load);
-        parse_file(load_relative_path); // @TODO: Run this in another thread?
+
+        // Defer parse_file() until after the file is fully parsed so that all
+        // parent pointers are set and should_skip_for_os() can walk the full chain.
+        array_add(*data.pending_loads, .{ load = _load, path = load_relative_path });
     }
 
     if !node.parent {
@@ -1910,5 +2015,175 @@ compound_declaration_to_declarations :: (decls: *[..]*Declaration, comp_decl: *C
         decl.expression = item_expr;
 
         array_add(decls, decl);
+    }
+}
+
+// ============================================================================
+// Reverse #load map and file context discovery
+//
+// Solves the problem where opening a file that is #load'd by another file
+// (e.g., game/entity.jai loaded by game/main.jai) yields no completions
+// because the parent file was never parsed.
+// ============================================================================
+
+// Scan raw file text for #load "..." directives and return the quoted paths.
+// This is a lightweight text scan (no parsing) for building the reverse map.
+scan_file_for_load_paths :: (content: string) -> [..]string {
+    results: [..]string;
+
+    i := 0;
+    while i + 5 <= content.count {
+        if content[i] == #char "#"
+        && i + 4 < content.count
+        && content[i+1] == #char "l"
+        && content[i+2] == #char "o"
+        && content[i+3] == #char "a"
+        && content[i+4] == #char "d" {
+            j := i + 5;
+            // Skip whitespace
+            while j < content.count && (content[j] == #char " " || content[j] == #char "\t") {
+                j += 1;
+            }
+            // Check for opening quote
+            if j < content.count && content[j] == #char "\"" {
+                j += 1;
+                start := j;
+                while j < content.count && content[j] != #char "\"" {
+                    j += 1;
+                }
+                if j < content.count {
+                    path_str: string;
+                    path_str.data = content.data + start;
+                    path_str.count = j - start;
+                    array_add(*results, copy_string(path_str));
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    return results;
+}
+
+// Walk all .jai files in the workspace and build a multi-map:
+//   loaded_file_absolute_path -> loading_file_absolute_path
+// This allows us to find a file's parent in the #load chain even if the
+// parent hasn't been parsed yet.
+build_reverse_load_map :: () {
+    table_reset(*server.reverse_load_map);
+
+    all_jai_files: [..]string;
+    defer {
+        for all_jai_files free(it);
+        array_free(all_jai_files);
+    }
+
+    visit_files(server.project_root, true, *all_jai_files, (info: *File_Visit_Info, files: *[..]string) {
+        if info.is_directory return;
+        if !contains(info.short_name, ".jai") return;
+        array_add(files, copy_string(info.full_name));
+    }, visit_directories=true);
+
+    for file_path: all_jai_files {
+        content, exists := read_entire_file(file_path, log_errors=false);
+        if !exists continue;
+        defer free(content);
+
+        file_dir := trim_right(path_strip_filename(file_path), "/");
+        load_paths := scan_file_for_load_paths(content);
+        defer {
+            for load_paths free(it);
+            array_free(load_paths);
+        }
+
+        for load_path: load_paths {
+            absolute_loaded_path := join(file_dir, load_path, separator="/");
+            table_add(*server.reverse_load_map, copy_string(absolute_loaded_path), copy_string(file_path));
+            free(absolute_loaded_path);
+        }
+    }
+
+    log("Built reverse load map with % entries", server.reverse_load_map.count);
+}
+
+// When a file is opened that isn't in the #load graph, try to discover
+// its parent file and parse the whole chain so completions work.
+ensure_file_context :: (file_path: string) {
+    // If the file is already tracked and has meaningful links, skip.
+    existing := get_file(file_path);
+    if existing && existing.linked_files.count > 2 {
+        return;
+    }
+
+    // Strategy 1: Look up the reverse load map for parent files.
+    found_parent := false;
+    for loader_path: table_find_multiple(*server.reverse_load_map, file_path) {
+        loader_file := get_file(loader_path);
+        if !loader_file {
+            parse_file(loader_path, true);
+            found_parent = true;
+        }
+    }
+
+    if found_parent return;
+
+    // Strategy 2: Check for module.jai in the same directory.
+    file_dir := trim_right(path_strip_filename(file_path), "/");
+    module_path := tprint("%/module.jai", file_dir);
+    if file_exists(module_path) && module_path != file_path {
+        module_file := get_file(module_path);
+        if !module_file {
+            parse_file(module_path, true);
+            return;
+        }
+    }
+
+    // Strategy 3: Scan sibling .jai files for text containing this filename.
+    dir_part := path_strip_filename(file_path);
+    short_name: string;
+    short_name.data = file_path.data + dir_part.count;
+    short_name.count = file_path.count - dir_part.count;
+
+    if short_name.count == 0 return;
+
+    sibling_files: [..]string;
+    defer {
+        for sibling_files free(it);
+        array_free(sibling_files);
+    }
+
+    visit_files(file_dir, false, *sibling_files, (info: *File_Visit_Info, files: *[..]string) {
+        if info.is_directory return;
+        if !contains(info.short_name, ".jai") return;
+        array_add(files, copy_string(info.full_name));
+    }, visit_directories=false);
+
+    for sibling: sibling_files {
+        if sibling == file_path continue;
+
+        content, exists := read_entire_file(sibling, log_errors=false);
+        if !exists continue;
+        defer free(content);
+
+        // Quick check: does this file contain a #load of our filename?
+        if contains(content, short_name) {
+            load_paths := scan_file_for_load_paths(content);
+            defer {
+                for load_paths free(it);
+                array_free(load_paths);
+            }
+
+            for load_path: load_paths {
+                if contains(load_path, short_name) {
+                    sibling_file := get_file(sibling);
+                    if !sibling_file {
+                        parse_file(sibling, true);
+                    }
+                    break sibling;
+                }
+            }
+        }
     }
 }

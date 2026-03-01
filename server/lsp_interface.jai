@@ -497,7 +497,7 @@ LSP_Result_Initialize :: struct {
         workspaceSymbolProvider := true;
 
         definitionProvider := true;
-        // hoverProvider := true;
+        hoverProvider := true;
 
         signatureHelpProvider: struct {
             triggerCharacters   := string.["("];
@@ -633,7 +633,44 @@ LSP_Completion_Item :: struct {
 
 LSP_Hover :: struct {
     contents: string;
-    contentFormat:= "markdown";
+}
+
+// --- File Watcher Types ---
+
+LSP_File_System_Watcher :: struct {
+    globPattern: string;
+    kind: u32;
+}
+
+LSP_Did_Change_Watched_Files_Registration_Options :: struct {
+    watchers: []LSP_File_System_Watcher;
+}
+
+LSP_Registration :: struct {
+    id: string;
+    method: string;
+    registerOptions: LSP_Did_Change_Watched_Files_Registration_Options;
+}
+
+LSP_Register_Capability_Request :: struct {
+    using base: LSP_Message;
+    id: s64;
+    method: string = "client/registerCapability";
+    params: struct {
+        registrations: []LSP_Registration;
+    };
+}
+
+LSP_File_Event :: struct {
+    uri: string;
+    type: u32;  // 1=Created, 2=Changed, 3=Deleted
+}
+
+LSP_Did_Change_Watched_Files :: struct {
+    using request: LSP_Request_Message;
+    params: struct {
+        changes: []LSP_File_Event;
+    };
 }
 
 LSP_Folding_Range_Client_Capabilities :: struct {

@@ -1,5 +1,47 @@
 
 
+// Extract the partial identifier the user has typed so far at the cursor position.
+// Returns the text from the start of the current word to the cursor.
+get_completion_prefix :: (file_path: string, position: LSP_Position) -> string {
+    content := cast(string) get_memory_file(file_path);
+    if content.count == 0 return "";
+
+    // Find the byte offset of the start of the cursor's line
+    current_line: u32 = 0;
+    line_start := 0;
+
+    for i: 0..content.count-1 {
+        if current_line == position.line break;
+        if content[i] == #char "\n" {
+            current_line += 1;
+            line_start = i + 1;
+        }
+    }
+
+    // Cursor byte offset within the file
+    cursor_offset := line_start + cast(int) position.character;
+    if cursor_offset > content.count cursor_offset = content.count;
+
+    // Walk backward from cursor to find identifier start
+    start := cursor_offset;
+    while start > line_start {
+        c := content[start - 1];
+        is_ident := (c >= #char "a" && c <= #char "z")
+                 || (c >= #char "A" && c <= #char "Z")
+                 || (c >= #char "0" && c <= #char "9")
+                 || c == #char "_";
+        if !is_ident break;
+        start -= 1;
+    }
+
+    if start == cursor_offset return "";
+
+    result: string;
+    result.data = content.data + start;
+    result.count = cursor_offset - start;
+    return result;
+}
+
 handle_completitions :: (request: LSP_Request_Message_Completion) {
     push_allocator(temp);
 
@@ -65,8 +107,9 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
     }
 
     // General
+    prefix := get_completion_prefix(file_path, request.params.position);
     decls := get_declarations(file, cursor_node, *cursor_location);
-    send_completions_decls(request, decls, should_add_basic_keywords=true);
+    send_completions_decls(request, decls, should_add_basic_keywords=true, prefix=prefix);
 }
 
 handle_completions_struct::(request:LSP_Request_Message_Completion, node:*Node) -> bool {
@@ -433,45 +476,30 @@ handle_completitions_for_node :: (request: LSP_Request_Message_Completion, node:
     return true;
 }
 
-add_basic_keywords :: (completions: *[..]LSP_Completion_Item) {
-    array_add(completions, .{label="string", insertText="string", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="bool", insertText="bool", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="int", insertText="int", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="s64", insertText="s64", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="s32", insertText="s32", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="s16", insertText="s16", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="s8", insertText="s8", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="u8", insertText="u8", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="u16", insertText="u16", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="u32", insertText="u32", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="u64", insertText="u64", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="float", insertText="float", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="float32", insertText="float32", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="float64", insertText="float64", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="Any", insertText="Any", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
+add_basic_keywords :: (completions: *[..]LSP_Completion_Item, prefix := "") {
+    keywords :: string.[
+        "string", "bool", "int",
+        "s64", "s32", "s16", "s8",
+        "u8", "u16", "u32", "u64",
+        "float", "float32", "float64",
+        "Any",
+        "struct", "enum", "enum_flags",
+        "return", "break", "case", "remove", "continue",
+        "if", "else", "for", "then", "using",
+    ];
 
-    array_add(completions, .{label="struct", insertText="struct", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="enum", insertText="enum", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="enum_flags", insertText="enum_flags", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-
-    array_add(completions, .{label="return", insertText="return", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="break", insertText="break", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="case", insertText="case", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="remove", insertText="remove", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="continue", insertText="continue", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="if", insertText="if", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="else", insertText="else", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="for", insertText="for", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="then", insertText="then", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
-    array_add(completions, .{label="using", insertText="using", kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
+    for kw: keywords {
+        if prefix.count > 0 && !begins_with(kw, prefix) continue;
+        array_add(completions, .{label=kw, insertText=kw, kind=cast(u8) LSP_Completion_Item.Kind.Keyword});
+    }
 }
 
-send_completions_decls :: (request: LSP_Request_Message_Completion, decls: []*Declaration, should_add_basic_keywords := false) {
+send_completions_decls :: (request: LSP_Request_Message_Completion, decls: []*Declaration, should_add_basic_keywords := false, prefix := "") {
     completions: [..]LSP_Completion_Item;
     defer array_free(completions);
 
     if should_add_basic_keywords {
-        add_basic_keywords(*completions);
+        add_basic_keywords(*completions, prefix);
     }
 
     ast_print_to_string :: (node: *Node) -> string {
@@ -482,6 +510,9 @@ send_completions_decls :: (request: LSP_Request_Message_Completion, decls: []*De
 
     for decl: decls {
         if !decl.expression && !decl.type_inst continue;
+
+        // Filter by prefix if one was provided
+        if prefix.count > 0 && !begins_with(decl.name, prefix) continue;
 
         preview_node: *Node;
         if decl.expression {
