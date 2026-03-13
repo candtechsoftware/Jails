@@ -32,6 +32,9 @@ Linked_File :: struct {
     file: *Program_File;
 }
 
+cached_preload_file: *Program_File;
+cached_runtime_support_file: *Program_File;
+
 resizable_array_identifier := Identifier.{
     name = "Resizable_Array",
 };
@@ -220,6 +223,10 @@ parse_file :: (path: string, force := false) {
     if content_from_file free(content);
     // log("Parsed: % (nodes: %, declarations: %, pointer: %)", path, file.nodes.count, file.declarations.count, file);
 
+    // Cache runtime/preload pointers at parse time to avoid scanning all files in analyze_files
+    if contains(path, "Preload.jai") cached_preload_file = file;
+    if contains(path, "Runtime_Support.jai") cached_runtime_support_file = file;
+
     array_add_if_unique(*server.files_to_be_analyzed, file);
 
     // We must revalidate all files that are using this file in some way.
@@ -240,16 +247,21 @@ analyze_files :: () {
         release(*file.analysis_pool);
     }
 
-    preload_file: *Program_File;
-    runtime_support_file: *Program_File;
+    preload_file := cached_preload_file;
+    runtime_support_file := cached_runtime_support_file;
 
-    for file: server.files {
-        if !runtime_support_file && contains(file.path, "Runtime_Support.jai") {
-            runtime_support_file = file;
-        }
+    // Fallback: scan all files if cache misses (e.g. file was removed and re-added)
+    if !preload_file || !runtime_support_file {
+        for file: server.files {
+            if !runtime_support_file && contains(file.path, "Runtime_Support.jai") {
+                runtime_support_file = file;
+                cached_runtime_support_file = file;
+            }
 
-        if !preload_file && contains(file.path, "Preload.jai") {
-            preload_file = file;
+            if !preload_file && contains(file.path, "Preload.jai") {
+                preload_file = file;
+                cached_preload_file = file;
+            }
         }
     }
 

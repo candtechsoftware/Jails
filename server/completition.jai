@@ -106,6 +106,85 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
         // }
     }
 
+    // Dot completion fallback: when cursor is right after "expr." and the AST didn't
+    // produce a DOT binary op node at this position, look up the node before the dot
+    // and resolve its type for member completions.
+    {
+        content := cast(string) get_memory_file(file_path);
+        pos := request.params.position;
+        if content.count > 0 && pos.character > 0 {
+            // Find byte offset of cursor position
+            current_line: u32 = 0;
+            line_start := 0;
+            for i: 0..content.count-1 {
+                if current_line == pos.line break;
+                if content[i] == #char "\n" {
+                    current_line += 1;
+                    line_start = i + 1;
+                }
+            }
+            cursor_byte := line_start + cast(int) pos.character;
+            if cursor_byte > 0 && cursor_byte <= content.count && content[cursor_byte - 1] == #char "." {
+                // Character before cursor is a dot — try to resolve the expression before it
+                pre_dot_pos := LSP_Position.{ line = pos.line, character = pos.character - 1 };
+                pre_dot_location := lsp_location_to_node_location(pre_dot_pos, file_path);
+                pre_dot_node := get_node_by_location(file, pre_dot_location);
+                if pre_dot_node {
+                    node_type := get_node_type(pre_dot_node);
+                    if node_type && handle_completitions_for_node(request, node_type) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    // Text-based fallback for #import/#load completion when parser fails to produce AST nodes
+    {
+        content := cast(string) get_memory_file(file_path);
+        pos := request.params.position;
+        if content.count > 0 {
+            // Find the current line text up to cursor
+            current_line: u32 = 0;
+            line_start := 0;
+            for i: 0..content.count-1 {
+                if current_line == pos.line break;
+                if content[i] == #char "\n" {
+                    current_line += 1;
+                    line_start = i + 1;
+                }
+            }
+            cursor_byte := line_start + cast(int) pos.character;
+            if cursor_byte > content.count cursor_byte = content.count;
+
+            line_up_to_cursor: string;
+            line_up_to_cursor.data = content.data + line_start;
+            line_up_to_cursor.count = cursor_byte - line_start;
+
+            trimmed := trim_left(line_up_to_cursor);
+
+            if contains(trimmed, "#import \"") {
+                handle_completitions_import(request, null);
+                return;
+            }
+
+            if contains(trimmed, "#load \"") {
+                // Extract partial path after #load "
+                partial_path := "";
+                load_quote_idx := find_index_from_right(trimmed, "\"");
+                if load_quote_idx >= 0 && load_quote_idx + 1 < trimmed.count {
+                    partial_path = slice(trimmed, load_quote_idx + 1, trimmed.count - load_quote_idx - 1);
+                }
+
+                temp_load: Directive_Load;
+                temp_load.file = partial_path;
+
+                handle_completitions_load(request, file, *temp_load);
+                return;
+            }
+        }
+    }
+
     // General
     prefix := get_completion_prefix(file_path, request.params.position);
     decls := get_declarations(file, cursor_node, *cursor_location);

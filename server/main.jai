@@ -32,7 +32,8 @@ Server :: struct {
     memory_files_lock: Mutex;
     memory_files: Table(string, [..]u8); // @todo: This is probably dumb - store files as array of lines instead (is this good idea?) // @ToDo: Keep track of a modified flag per file
 
-    previously_errored_file: string;
+    previously_errored_file: string; // kept for single-error compat
+    previously_errored_files: [..]string;
 
     diagnostics_metaprogram_path: string;
 
@@ -356,6 +357,7 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             success, body := json_parse_string(raw_request, LSP_Request_Message_Definition,, temp);
             if !success {
                 log_error("Unable to parse textDocument/definition message");
+                lsp_respond(request.id, null);
                 return;
             }
 
@@ -411,6 +413,7 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             success, body := json_parse_string(raw_request, LSP_Request_Message_Document_Symbol);
             if !success {
                 log_error("Unable to parse textDocument/documentSymbol message");
+                lsp_respond(request.id, null);
                 return;
             }
 
@@ -422,6 +425,7 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             success, body := json_parse_string(raw_request, LSP_Request_Message_Workspace_Symbol);
             if !success {
                 log_error("Unable to parse workspace/symbol message");
+                lsp_respond(request.id, null);
                 return;
             }
 
@@ -443,6 +447,7 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             success, body := json_parse_string(raw_request, LSP_Request_Message_Completion,, temp);
             if !success {
                 log_error("Unable to parse textDocument/completion message");
+                lsp_respond(request.id, null);
                 return;
             }
 
@@ -451,7 +456,8 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
         case "textDocument/signatureHelp";
             success, body := json_parse_string(raw_request, LSP_Request_Message_Signature_Help,, temp);
             if !success {
-                log_error("Unable to parse textDocument/completion message");
+                log_error("Unable to parse textDocument/signatureHelp message");
+                lsp_respond(request.id, null);
                 return;
             }
 
@@ -461,10 +467,21 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             success, body := json_parse_string(raw_request, LSP_Request_Message_Hover,, temp);
             if !success {
                 log_error("Unable to parse textDocument/hover message");
+                lsp_respond(request.id, null);
                 return;
             }
 
             handle_hover(body);
+
+        case "textDocument/references";
+            success, body := json_parse_string(raw_request, LSP_Request_Message_References,, temp);
+            if !success {
+                log_error("Unable to parse textDocument/references message");
+                lsp_respond(request.id, null);
+                return;
+            }
+
+            handle_references(body);
 
         case "workspace/didChangeWatchedFiles";
             success, body := json_parse_string(raw_request, LSP_Did_Change_Watched_Files,, temp);
@@ -590,6 +607,7 @@ main :: () {
 #load "hover.jai";
 #load "symbols.jai";
 #load "utils.jai";
+#load "references.jai";
 
 #if OS == .WINDOWS {
     #import "Windows";

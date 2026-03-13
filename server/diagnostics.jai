@@ -10,11 +10,74 @@ reset_diagnostics :: () {
             }
         });
     }
+
+    for errored_file: server.previously_errored_files {
+        if errored_file == server.previously_errored_file continue;
+        lsp_send(LSP_Client_Message(LSP_Publish_Diagnostics).{
+            method="textDocument/publishDiagnostics",
+            params = .{
+                uri = errored_file,
+                diagnostics = LSP_Diagnostic.[]
+            }
+        });
+        free(errored_file);
+    }
+    array_reset(*server.previously_errored_files);
 }
 
-// Currently, parse only the first error (maybe parsing multiple errors is not that useful because Jai mostly report one error at a time)
-// @TODO: Make it work with multiple errors
-// @todo: add support for warnings
+Parsed_Diagnostic :: struct {
+    file: string;
+    diagnostic: LSP_Diagnostic;
+}
+
+parse_error_line :: (output_line: string) -> (ok: bool, file: string, diagnostic: LSP_Diagnostic) {
+    ERROR_MARKER :: ": Error:";
+    WARNING_MARKER :: ": Warning:";
+
+    marker: string;
+    severity: LSP_Diagnostic_Severity;
+
+    if contains(output_line, ERROR_MARKER) {
+        marker = ERROR_MARKER;
+        severity = .ERROR;
+    } else if contains(output_line, WARNING_MARKER) {
+        marker = WARNING_MARKER;
+        severity = .WARNING;
+    } else {
+        return false, "", .{};
+    }
+
+    message_index := find_index_from_right(output_line, marker);
+    message := slice(output_line, message_index + marker.count, output_line.count - message_index);
+    rest := slice(output_line, 0, message_index);
+
+    split_ok: bool;
+    file: string;
+    location: string;
+    split_ok, file, location = split_from_right(rest, ":");
+    file = replace(file, "//", "/",, temp);
+    if !split_ok return false, "", .{};
+
+    line_and_character := split(location, ",");
+    if line_and_character.count < 2 return false, "", .{};
+
+    line, l_ok := parse_int(*line_and_character[0], u32);
+    if !l_ok return false, "", .{};
+
+    character, c_ok := parse_int(*line_and_character[1], u32);
+    if !c_ok return false, "", .{};
+
+    diag: LSP_Diagnostic;
+    diag.message = message;
+    diag.severity = xx severity;
+    diag.range.start.line = line-1;
+    diag.range.start.character = character-1;
+    diag.range.end.line = line-1;
+    diag.range.end.character = character-1;
+
+    return true, file, diag;
+}
+
 run_diagnostics :: () {
     if server.build_root.count == 0 return;
     build_root_absolute := join(server.project_root, server.build_root, separator="/");
@@ -62,73 +125,77 @@ run_diagnostics :: () {
     lines := split(error, "\n");
     defer array_free(lines);
 
-    file: string;
-    diagnostic: LSP_Diagnostic;
+    // Parse all errors and warnings from compiler output
+    parsed_diagnostics: [..]Parsed_Diagnostic;
+    defer array_free(parsed_diagnostics);
 
-    ERROR_MARKER :: ": Error:";
-    // Get the first error
-    for output_line: lines {
-        if !contains(output_line, ERROR_MARKER) continue;
-
-        message_index := find_index_from_right(output_line, ERROR_MARKER);
-        message := slice(output_line, message_index + ERROR_MARKER.count, output_line.count - message_index);
-        rest := slice(output_line, 0, message_index);
-
-        ok: bool;
-        location: string;
-        ok, file, location = split_from_right(rest, ":");
-        file = replace(file, "//", "/",, temp);
+    for i: 0..lines.count-1 {
+        output_line := lines[i];
+        ok, file, diagnostic := parse_error_line(output_line);
         if !ok continue;
 
-        line_and_character := split(location, ",");
-        if line_and_character.count < 2 continue;
+        // Look ahead for highlight carets (^^^^^) to determine error range width
+        highlighted_chars: u32;
+        for j: i+1..lines.count-1 {
+            caret_line := lines[j];
+            if !contains(caret_line, #char "^") continue;
 
-        line, l_ok := parse_int(*line_and_character[0], u32);
-        if !l_ok continue;
-
-        character, c_ok := parse_int(*line_and_character[1], u32);
-        if !c_ok continue;
-
-        diagnostic.message = message;
-        diagnostic.severity = xx LSP_Diagnostic_Severity.ERROR;
-
-        diagnostic.range.start.line = line-1;
-        diagnostic.range.start.character = character-1;
-    }
-
-    highlight_found := false;
-    highlighted_chars: u32;
-
-    for line: lines {
-        if highlight_found || !contains(line, #char "^") continue;
-
-        for char: cast([]u8) line {
-            if char != #char "^" continue;
-            highlighted_chars += 1;
+            for char: cast([]u8) caret_line {
+                if char == #char "^" highlighted_chars += 1;
+            }
+            break;
         }
 
-        highlight_found = true;
-    }
-
-    diagnostic.range.end.line = diagnostic.range.start.line;
-    diagnostic.range.end.character = diagnostic.range.start.character+highlighted_chars;
-
-    diagnostics: [1]LSP_Diagnostic;
-    diagnostics[0] = diagnostic;
-
-    file = path_to_lsp_path(normalize_path(file,, temp)); // split_from_right and slice don't allocate memory so copy the file in case the string with compiler output is freed
-
-    lsp_send(LSP_Client_Message(LSP_Publish_Diagnostics).{
-        method="textDocument/publishDiagnostics",
-        params = .{
-            uri = file,
-            diagnostics = diagnostics
+        if highlighted_chars > 0 {
+            diagnostic.range.end.character = diagnostic.range.start.character + highlighted_chars;
         }
-    });
 
-    if file != server.previously_errored_file {
-        free(server.previously_errored_file);
+        array_add(*parsed_diagnostics, .{ file=file, diagnostic=diagnostic });
     }
 
-    server.previously_errored_file = file;
+    if parsed_diagnostics.count == 0 return;
+
+    // Group diagnostics by file and publish
+    // Use a simple approach: collect unique files, then gather diagnostics for each
+    published_files: [..]string;
+    defer array_free(published_files);
+
+    for pd: parsed_diagnostics {
+        already_published := false;
+        for pf: published_files {
+            if pf == pd.file { already_published = true; break; }
+        }
+        if already_published continue;
+
+        // Collect all diagnostics for this file
+        file_diagnostics: [..]LSP_Diagnostic;
+        defer array_free(file_diagnostics);
+
+        for pd2: parsed_diagnostics {
+            if pd2.file == pd.file {
+                array_add(*file_diagnostics, pd2.diagnostic);
+            }
+        }
+
+        file_uri := path_to_lsp_path(normalize_path(pd.file,, temp));
+
+        lsp_send(LSP_Client_Message(LSP_Publish_Diagnostics).{
+            method="textDocument/publishDiagnostics",
+            params = .{
+                uri = file_uri,
+                diagnostics = file_diagnostics
+            }
+        });
+
+        array_add(*published_files, file_uri);
+        array_add(*server.previously_errored_files, copy_string(file_uri));
+    }
+
+    // Update legacy single-file tracking for backwards compat with reset_diagnostics
+    if server.previously_errored_files.count > 0 {
+        if server.previously_errored_file.count > 0 {
+            free(server.previously_errored_file);
+        }
+        server.previously_errored_file = copy_string(server.previously_errored_files[0]);
+    }
 }
