@@ -49,11 +49,6 @@ array_count_declaration := Declaration.{
     type_inst = xx *s64_node
 };
 
-init_file :: (using file: Program_File) {
-    init(*declarations);
-    // init(*resolved_identifiers);
-}
-
 deinit_file :: (using file: Program_File) {
     deinit(*declarations);
     array_free(nodes);
@@ -161,7 +156,6 @@ parse_file :: (input_path: string, force := false) {
         file.path = copy_string(path);
         set_allocators(*file.ast_pool, context.default_allocator);
         set_allocators(*file.analysis_pool, context.default_allocator);
-        init_file(file);
         table_add(*server.files, file.path, file);
     }
 
