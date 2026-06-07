@@ -347,6 +347,8 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             to_send: LSP_Result_Initialize;
             lsp_respond(body.id, to_send);
 
+            run_diagnostics();
+
         case "textDocument/definition";
             success, body := json_parse_string(raw_request, LSP_Request_Message_Definition,, temp);
             if !success {
@@ -385,7 +387,7 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
 
             parse_file(file_path);
             analyze_files();
-            run_diagnostics();
+            // run_diagnostics();
 
             log("File_path: %", file_path);
 

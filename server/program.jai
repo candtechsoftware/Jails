@@ -1499,7 +1499,7 @@ get_dot_path :: (binary_op: *Binary_Operation, from: *Node) -> []*Node {
             return path;
         }
     }
-    
+
     current_op: *Binary_Operation = root_binary_op;
     while current_op.parent && current_op.parent.kind == .BINARY_OPERATION {
         current_op = cast(*Binary_Operation, current_op.parent);
@@ -1510,7 +1510,7 @@ get_dot_path :: (binary_op: *Binary_Operation, from: *Node) -> []*Node {
 
         if current_op.left array_add(*path, current_op.left);
     }
-    
+
     array_reverse(path);
 
     return path;
@@ -1875,7 +1875,7 @@ compound_declaration_to_declarations :: (decls: *[..]*Declaration, comp_decl: *C
 
                 if proc_node.kind == .PROCEDURE {
                     proc := cast(*Procedure) proc_node;
-                    
+
                     if it_index < proc.returns.count {
                         item_expr = proc.returns[it_index];
                     }
