@@ -2,9 +2,13 @@
 
 ## 0.3.0
 - [ ] support for context
-- [ ] goto and autocomplete for struct literals
+- [x] goto and autocomplete for struct literals (dotless `.{...}` literals infer their type from declaration/assignment/call-site)
 - [ ] improve context based autocomplete
 - [ ] polymorphic types
+- [x] Implicit `.VALUE` enum completions in procedure call arguments, positional and named (issue #19)
+- [x] Aliased module completions (`rl.`) no longer fall back to generic scope completions and no longer leak `#scope_file` symbols (issue #20)
+- [x] Diagnostics: fix compiler invocation when `-jai_path` is given without `-jai_exe_name`; report warnings (e.g. deprecated) as well as errors; multiple diagnostics across files; attach `Info:`/`...` lines to the diagnostic message
+- [x] LSP integration test harness (`scripts/lsp_test.py` + `tests/fixtures/project/`) and parser corpus runner (`scripts/run_parser_tests.sh`)
 - [ ] ...
 
 ## 0.2.0
@@ -37,4 +41,4 @@
 - [ ] Mason registry (nvim)
 - [ ] Implement "fake" methods completions for types that are taken as the first argument of some procedures
 - [ ] Improve Linux and nvim support
-
+- [ ] Auto complet do completion for loops etierh it. or for n: ...} the n needs autocoeplt n.

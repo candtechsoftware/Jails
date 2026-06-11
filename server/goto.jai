@@ -156,26 +156,17 @@ handle_goto_struct_literal :: (request: LSP_Request_Message_Definition, file: *P
 
     literal := cast(*Literal) binary_op.parent;
 
-    // TODO: Infer the type for .{} structs literals...
-    if literal.value_type != .STRUCT || !literal.struct_literal_info.type || literal.struct_literal_info.type.kind != .IDENTIFIER {
+    if literal.value_type != .STRUCT {
         return false;
     }
 
-    // We need to resolve struct literal type.
-    decls := get_identifier_decls(cast(*Identifier) literal.struct_literal_info.type);
-    if decls.count == 0 {
+    // Resolve the struct type, inferring it for dotless `.{...}` literals from the surrounding context.
+    literal_type := get_struct_literal_type(literal);
+    if !literal_type {
         return false;
     }
 
-    struct_decl := decls[0];
-    if !struct_decl.expression {
-        return false;
-    }
-
-
-    _struct := cast(*Struct) struct_decl.expression;
-
-    decl := get_member_in(_struct, ident);
+    decl := get_member_in(literal_type, ident);
     if !decl {
         return false;
     }
@@ -210,6 +201,34 @@ handle_goto_assignment :: (request: LSP_Request_Message_Definition, ident: *Iden
 
     lsp_respond(request.id, node_location_to_lsp_location(decl.location));
 
+    return true;
+}
+
+// Resolves implicit `.VALUE` arguments in procedure calls, e.g. `take(.NORTH)` or `take(d = .NORTH)`,
+// mirroring handle_procedure_argument_completions.
+handle_goto_call_argument :: (request: LSP_Request_Message_Definition, ident: *Identifier) -> bool {
+    if !ident.parent || ident.parent.kind != .UNARY_OPERATION {
+        return false;
+    }
+
+    unary_op := cast(*Unary_Operation, ident.parent);
+
+    call, argument_node, argument_name := get_call_argument_context(unary_op);
+    if !call {
+        return false;
+    }
+
+    argument_type := get_argument_type_for_call(call, argument_node, argument_name);
+    if !argument_type {
+        return false;
+    }
+
+    decl := get_member_in(argument_type, ident);
+    if !decl {
+        return false;
+    }
+
+    lsp_respond(request.id, node_location_to_lsp_location(decl.location));
     return true;
 }
 
@@ -302,6 +321,10 @@ handle_goto :: (request: LSP_Request_Message_Definition) {
     }
 
     if handle_goto_assignment(request, ident) {
+        return;
+    }
+
+    if handle_goto_call_argument(request, ident) {
         return;
     }
 

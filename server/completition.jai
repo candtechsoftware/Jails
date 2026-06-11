@@ -21,6 +21,16 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
 
     cursor_node := get_node_by_location(file, cursor_location);
 
+    // When the cursor sits right after a '.' that already has an identifier behind it (e.g. revisiting
+    // `take(.NORTH)`), the narrowest node at that location is the identifier; step up to the unary dot
+    // itself so the handlers below can see the context the same way as while typing a bare dot.
+    if cursor_node && cursor_node.kind == .IDENTIFIER && cursor_node.parent && cursor_node.parent.kind == .UNARY_OPERATION {
+        unary := cast(*Unary_Operation) cursor_node.parent;
+        if unary.operation == .DOT {
+            cursor_node = unary;
+        }
+    }
+
     if cursor_node {
         // We don't wanna to give completions inside strings.
         if cursor_node.kind == .DIRECTIVE_STRING || (cursor_node.kind == Node.Kind.LITERAL && cursor_node.(*Literal).value_type == .STRING) {
@@ -39,6 +49,10 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
         }
 
         if handle_dot_completitions(request, cursor_node, cursor_location) {
+            return;
+        }
+
+        if handle_procedure_argument_completions(request, cursor_node) {
             return;
         }
 
@@ -193,6 +207,15 @@ handle_dot_completitions :: (request: LSP_Request_Message_Completion, cursor_nod
         op = cast(*Binary_Operation) cursor_node;
     } else if is_dot_binary_op(cursor_node.parent) {
         op = cast(*Binary_Operation) cursor_node.parent;
+    } else if cursor_node.parent && cursor_node.parent.kind == .PROCEDURE_CALL {
+        // The right side of a dot can be a procedure call (`alias.proc(...)`); when the cursor is on
+        // the callee itself we still want member completions for the left side of the dot.
+        call := cast(*Procedure_Call) cursor_node.parent;
+        if call.procedure == cursor_node && is_dot_binary_op(call.parent) {
+            op = cast(*Binary_Operation) call.parent;
+        } else {
+            return false;
+        }
     } else {
         return false;
     }
@@ -238,6 +261,32 @@ handle_dot_completitions :: (request: LSP_Request_Message_Completion, cursor_nod
     }
 
     return handle_completitions_for_node(request, type);
+}
+
+// Completes implicit `.VALUE` arguments in procedure calls, e.g. `take(.` or `take(d = .`,
+// by inferring the expected enum/struct type from the called procedure's signature (issue #19).
+handle_procedure_argument_completions :: (request: LSP_Request_Message_Completion, cursor_node: *Node) -> bool {
+    if cursor_node.kind != .UNARY_OPERATION return false;
+
+    unary := cast(*Unary_Operation) cursor_node;
+
+    call, argument_node, argument_name := get_call_argument_context(unary);
+    if !call return false;
+
+    // From here on we know the user is typing an implicit `.` value inside a call, so generic
+    // scope completions would always be wrong - respond with the inferred members or nothing.
+
+    argument_type := get_argument_type_for_call(call, argument_node, argument_name);
+    if !argument_type || (argument_type.kind != .ENUM && argument_type.kind != .STRUCT && argument_type.kind != .UNION) {
+        lsp_respond(request.id, null);
+        return true;
+    }
+
+    if !handle_completitions_for_node(request, argument_type) {
+        lsp_respond(request.id, null);
+    }
+
+    return true;
 }
 
 handle_types_in_declaration :: (request: LSP_Request_Message_Completion, cursor_node: *Node) -> bool {
@@ -373,14 +422,16 @@ handle_completitions_for_node :: (request: LSP_Request_Message_Completion, node:
         case .DIRECTIVE_IMPORT;
             import := cast(*Directive_Import) node;
 
-            module_file_path := get_module_import_path(import, node.location.file);
-            module_file := get_file(module_file_path);
+            module_file := get_import_file(import);
 
             if !module_file {
-                return false;
+                // The left side is known to be a module alias here, so falling through to generic
+                // scope completions would suggest symbols that don't exist in the module.
+                lsp_respond(request.id, null);
+                return true;
             }
 
-            for get_declarations(module_file, only_loaded=true) {
+            for get_declarations(module_file, only_loaded=true, as_import=true) {
                 array_add(*decls, it);
             }
     }

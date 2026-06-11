@@ -540,22 +540,30 @@ add_all_fields_of :: (decls: *[..]*Declaration, node: *Node, filter_name: string
 }
 
 // @TODO: Refactor this! (stupid global variable)
-skip_using: *Using;
+// Stack of usings currently being resolved. A single pointer is not enough: with two usings in one
+// block (`using a; using b;`), resolving a's type re-enters the block and descends into b, which
+// re-enters and descends into a again - unbounded mutual recursion. A fixed buffer keeps this
+// allocation-free (request handlers run under the temporary allocator).
+USINGS_IN_PROGRESS_MAX :: 64;
+usings_in_progress: [USINGS_IN_PROGRESS_MAX]*Using;
+usings_in_progress_count: int;
 
 add_decls_from_using :: (decls: *[..]*Declaration, _using: *Using, name: string) {
-    if skip_using == _using || !_using.expression || _using.expression.kind != .IDENTIFIER return;
+    if !_using.expression || _using.expression.kind != .IDENTIFIER return;
+    if usings_in_progress_count >= USINGS_IN_PROGRESS_MAX return;
 
-    ident := cast(*Identifier) _using.expression;
+    for 0..usings_in_progress_count-1 {
+        if usings_in_progress[it] == _using return;
+    }
 
-    copied_using := skip_using;
-    skip_using = _using;
+    usings_in_progress[usings_in_progress_count] = _using;
+    usings_in_progress_count += 1;
+    defer usings_in_progress_count -= 1;
 
     used_type := get_node_type(_using.expression);
     if !used_type return;
 
     add_all_fields_of(decls, used_type, name);
-
-    skip_using = copied_using;
 }
 
 get_declarations_from_for :: (decls: *[..]*Declaration, node: *Node, from_loc: *Node.Location, name := "") {
@@ -746,7 +754,9 @@ get_declarations_from_parent :: (decls: *[..]*Declaration, node: *Node, from_loc
     get_declarations_from_parent(decls, node.parent, from_loc, name, only_consts);
 }
 
-get_declarations :: (file: *Program_File, from_node: *Node = null, from_loc: *Node.Location = null, name := "", only_loaded := false) -> []*Declaration {
+// `as_import` means we are looking at `file` from the outside through an import (e.g. completing
+// members of an aliased module); only export-scoped declarations are visible then.
+get_declarations :: (file: *Program_File, from_node: *Node = null, from_loc: *Node.Location = null, name := "", only_loaded := false, as_import := false) -> []*Declaration {
     decls: [..]*Declaration;
 
     // Globals in all linked files (loaded or imported)
@@ -758,8 +768,12 @@ get_declarations :: (file: *Program_File, from_node: *Node = null, from_loc: *No
                 continue;
             }
 
+            linked_from_import := linked_file.from_import || as_import;
+
             // -- Global using --
             // We are accepting usings only from loaded files.
+            // NOTE: if this gets revived, route it through add_decls_from_using (it carries the
+            // usings_in_progress recursion guard that replaced the old skip_using global).
             // if !linked_file.from_import {
 
             //     // This is stupid!!
@@ -772,36 +786,18 @@ get_declarations :: (file: *Program_File, from_node: *Node = null, from_loc: *No
             //             continue;
             //         }
 
-            //         _using := cast(*Using, it);
-
-            //         if skip_using == _using {
-            //             continue;
-            //         }
-
-            //         if !_using.expression {
-            //             continue;
-            //         }
-
-            //         copied_using := skip_using;
-            //         skip_using = _using;
-
-            //         used_type := get_node_type(_using.expression);
-            //         if !used_type continue;
-
-            //         add_all_fields_of(*decls, used_type, name);
-
-            //         skip_using = copied_using;
+            //         add_decls_from_using(*decls, cast(*Using, it), name);
             //     }
             // }
 
             // We are searching for specific decl
             if name.count > 0 {
                 for decl: table_find_multiple(*linked_file.file.declarations, name) {
-                    if is_global(decl, file, linked_file.file, linked_file.from_import) array_add(*decls, decl);
+                    if is_global(decl, file, linked_file.file, linked_from_import) array_add(*decls, decl);
                 }
             } else { // We are adding all globals decls
                 for decl: linked_file.file.declarations {
-                    if is_global(decl, file, linked_file.file, linked_file.from_import) array_add(*decls, decl);
+                    if is_global(decl, file, linked_file.file, linked_from_import) array_add(*decls, decl);
                 }
             }
         }
@@ -875,7 +871,7 @@ is_global :: (node: *Node, from_file: *Program_File, it_file: *Program_File, fro
 
         if directive_scope.scope_kind == .MODULE && !from_import return true;
         if directive_scope.scope_kind == .EXPORT return true;
-        if directive_scope.scope_kind == .FILE && from_file == it_file return true;
+        if directive_scope.scope_kind == .FILE && from_file == it_file && !from_import return true;
     }
 
     return false;
@@ -1111,6 +1107,17 @@ get_node_type :: (root: *Node, solve_array := false, select_decl := select_first
                         continue;
                     }
 
+                    // Dotless literal in a declaration (`value : My_Struct = .{...}`); infer the type
+                    // from the declaration. Call-site inference is handled in get_struct_literal_type
+                    // because get_best_overload_for_procedure_call recurses into get_node_type.
+                    if literal.parent && literal.parent.kind == .DECLARATION {
+                        decl := cast(*Declaration) literal.parent;
+                        if decl.type_inst && decl.type_inst != literal {
+                            current_node = decl.type_inst;
+                            continue;
+                        }
+                    }
+
                 case .ARRAY;
                     array_literal_info := literal.values.array_literal_info;
 
@@ -1317,20 +1324,70 @@ get_member_in :: (parent: *Node, ident: *Identifier) -> *Declaration {
     return decls[0];
 }
 
+// Resolves the struct type a literal refers to, inferring dotless `.{...}` literals from their
+// context: the declaration type, the assigned variable, or the called procedure's signature.
+get_struct_literal_type :: (literal: *Literal) -> *Node {
+    if literal.value_type != .STRUCT return null;
+
+    type_node := literal.values.struct_literal_info.type;
+
+    if !type_node && literal.parent {
+        if literal.parent.kind == {
+            case .DECLARATION;
+                // `value : My_Struct = .{...}`
+                decl := cast(*Declaration) literal.parent;
+                if decl.type_inst && decl.type_inst != literal {
+                    type_node = decl.type_inst;
+                }
+
+            case .PROCEDURE_CALL;
+                // `take(.{...})`
+                return get_argument_type_for_call(cast(*Procedure_Call) literal.parent, literal);
+
+            case .BINARY_OPERATION;
+                op := cast(*Binary_Operation) literal.parent;
+                if op.operation == .ASSIGN && op.right == literal {
+                    if op.parent && op.parent.kind == .PROCEDURE_CALL && op.left && op.left.kind == .IDENTIFIER {
+                        // `take(arg = .{...})`
+                        return get_argument_type_for_call(cast(*Procedure_Call) op.parent, op, cast(*Identifier, op.left).name);
+                    }
+
+                    // `value = .{...}`
+                    if op.left {
+                        return get_node_type(op.left);
+                    }
+                }
+        }
+    }
+
+    if !type_node return null;
+
+    return get_node_type(type_node);
+}
+
+// Resolves the Program_File of an import directive, e.g. the right side of `rl :: #import "raylib";`.
+get_import_file :: (import: *Directive_Import) -> *Program_File {
+    path_without_filename := trim_right(path_strip_filename(import.location.file), "/");
+    path := get_module_import_path(import, path_without_filename);
+    if path.count == 0 {
+        return null;
+    }
+
+    return get_file(normalize_path(path,, temp));
+}
+
 get_members_in :: (parent: *Node, ident: *Identifier) -> []*Declaration {
     decls: [..]*Declaration;
 
     if parent.kind == .DIRECTIVE_IMPORT {
         import := cast(*Directive_Import) parent;
 
-        module_file_path := get_module_import_path(import, parent.location.file);
-        module_file := get_file(module_file_path);
-
+        module_file := get_import_file(import);
         if !module_file {
             return decls;
         }
 
-        return get_declarations(module_file, only_loaded=true, name=ident.name);
+        return get_declarations(module_file, only_loaded=true, name=ident.name, as_import=true);
     }
 
     // Special case for array
@@ -1657,6 +1714,11 @@ get_path_type :: (path: []*Node, recursion_limit: s16 = 1024) -> *Node {
     }
 
     if current_type && current_type.kind == .IDENTIFIER && current_type.location.file.data != null {
+        // No progress: the identifier resolved to itself, so recursing would only burn the limit.
+        if path.count == 1 && path[0] == current_type {
+            return null;
+        }
+
         return get_path_type(.[current_type], recursion_limit - 1);
     }
 
@@ -1766,6 +1828,12 @@ get_best_overload_for_procedure_call :: (procedures: []*Procedure, call: *Proced
     current_best := 0;
     current_best_matched_args: u16 = 0;
 
+    // The call argument types don't depend on the overload, so resolve them only once.
+    call_arg_types := NewArray(call.arguments.count, *Node,, temp);
+    for call_arg, call_arg_index: call.arguments {
+        call_arg_types[call_arg_index] = get_node_type(call_arg);
+    }
+
     for procedure: procedures {
         matched_args: u16;
 
@@ -1776,7 +1844,7 @@ get_best_overload_for_procedure_call :: (procedures: []*Procedure, call: *Proced
         for call_arg, call_arg_index: call.arguments {
             arg := procedure.arguments[call_arg_index];
 
-            call_arg_type := get_node_type(call_arg);
+            call_arg_type := call_arg_types[call_arg_index];
             arg_type := get_node_type(arg);
 
             // log("Arg [%]: caller (% - %), calle (% - %)", arg_index, to_string(call_arg_type), call_arg_type.kind, to_string(arg_type), arg_type.kind);
@@ -1795,6 +1863,127 @@ get_best_overload_for_procedure_call :: (procedures: []*Procedure, call: *Proced
     }
 
     return current_best;
+}
+
+// Resolves the procedure declarations a call can refer to (including through a dot path like `alias.proc(...)`).
+get_procedures_for_call :: (call: *Procedure_Call) -> []*Procedure {
+    procedures: [..]*Procedure;
+
+    if !call.procedure || call.procedure.kind != .IDENTIFIER {
+        return procedures;
+    }
+
+    proc_ident := cast(*Identifier) call.procedure;
+
+    proc_decls: [..]*Declaration;
+    defer array_free(proc_decls);
+
+    if call.parent && is_dot_binary_op(call.parent) {
+        path := get_dot_path(cast(*Binary_Operation) call.parent, call);
+        if path.count > 1 {
+            path = array_view(path, 0, path.count-1);
+            type := get_path_type(path);
+            if type {
+                array_add(*proc_decls, ..get_members_in(type, proc_ident));
+            }
+        }
+    } else {
+        array_add(*proc_decls, ..get_identifier_decls(proc_ident));
+    }
+
+    for proc_decl: proc_decls {
+        if !proc_decl continue;
+
+        type := get_node_type(proc_decl, stop_at_procedure=true);
+        if !type || type.kind != .PROCEDURE continue;
+
+        array_add(*procedures, cast(*Procedure) type);
+    }
+
+    return procedures;
+}
+
+get_procedure_argument :: (procedure: *Procedure, index: int, name := "") -> *Declaration {
+    if name.count > 0 {
+        for arg: procedure.arguments {
+            unwrapped := unwrap_polymorphic_constant(arg);
+            if !unwrapped || unwrapped.kind != .DECLARATION continue;
+
+            decl := cast(*Declaration) unwrapped;
+            if decl.name == name return decl;
+        }
+
+        return null;
+    }
+
+    if index < 0 || index >= procedure.arguments.count return null;
+
+    unwrapped := unwrap_polymorphic_constant(procedure.arguments[index]);
+    if !unwrapped || unwrapped.kind != .DECLARATION return null;
+
+    return cast(*Declaration) unwrapped;
+}
+
+// Identifies the procedure-call argument context of an implicit `.` unary, either positional
+// (`take(.`) or named (`take(d = .`). Returns a null call when the unary is not a call argument.
+get_call_argument_context :: (unary: *Unary_Operation) -> (call: *Procedure_Call, argument_node: *Node, argument_name: string) {
+    if unary.operation != .DOT || !unary.parent {
+        return null, null, "";
+    }
+
+    if unary.parent.kind == .PROCEDURE_CALL {
+        return cast(*Procedure_Call) unary.parent, unary, "";
+    }
+
+    if unary.parent.kind == .BINARY_OPERATION {
+        assign := cast(*Binary_Operation) unary.parent;
+        if assign.operation != .ASSIGN return null, null, "";
+        if !assign.left || assign.left.kind != .IDENTIFIER return null, null, "";
+        if !assign.parent || assign.parent.kind != .PROCEDURE_CALL return null, null, "";
+
+        return cast(*Procedure_Call) assign.parent, assign, cast(*Identifier, assign.left).name;
+    }
+
+    return null, null, "";
+}
+
+// Resolves the expected type of an argument in a procedure call, either by name (`foo(flag = ...)`)
+// or by the position of `argument_node` in the call. Used for implicit `.VALUE` enum completions.
+get_argument_type_for_call :: (call: *Procedure_Call, argument_node: *Node, argument_name := "") -> *Node {
+    procedures := get_procedures_for_call(call);
+    defer array_free(procedures);
+
+    if procedures.count == 0 {
+        return null;
+    }
+
+    argument_index := -1;
+    if argument_name.count == 0 {
+        for call.arguments {
+            if it == argument_node {
+                argument_index = it_index;
+                break;
+            }
+        }
+
+        if argument_index < 0 return null;
+    }
+
+    // Prefer the best matching overload, but fall back to any overload that can resolve the argument.
+    best := get_best_overload_for_procedure_call(procedures, call);
+
+    for attempt: 0..procedures.count {
+        procedure_index := ifx attempt == 0 then best else attempt-1;
+        if attempt != 0 && procedure_index == best continue;
+
+        arg_decl := get_procedure_argument(procedures[procedure_index], argument_index, argument_name);
+        if !arg_decl continue;
+
+        type := get_node_type(arg_decl);
+        if type return type;
+    }
+
+    return null;
 }
 
 inside_comment :: (location: Node.Location) -> bool {

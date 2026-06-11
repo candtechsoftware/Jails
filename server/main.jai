@@ -1,4 +1,4 @@
-VERSION :: "0.2.22";
+VERSION :: "0.2.23";
 
 MEMORY_DEBUG :: false;
 
@@ -31,7 +31,7 @@ Server :: struct {
     memory_files_lock: Mutex;
     memory_files: Table(string, [..]u8); // @todo: This is probably dumb - store files as array of lines instead (is this good idea?) // @ToDo: Keep track of a modified flag per file
 
-    previously_errored_file: string;
+    previously_errored_files: [..]string;
 
     diagnostics_metaprogram_path: string;
 
@@ -484,6 +484,11 @@ main :: () {
         } else {
             log("Jai path: % (%)", server.args.jai_path, server.args.jai_exe_name);
         }
+    }
+
+    // When -jai_path is given without -jai_exe_name (or resolution failed) we still need an executable name.
+    if server.args.jai_exe_name.count == 0 {
+        server.args.jai_exe_name = DEFAULT_JAI_EXE_NAME;
     }
 
     log("Args are %", server.args);
