@@ -1,6 +1,6 @@
 // This file contains code for running compiler for getting errors and warning.
 
-DIAGNOSTICS_TIMEOUT_MS :: 30_000;
+DIAGNOSTICS_TIMEOUT_MS :: 120_000;
 
 Diagnostics :: struct {
     thread: Thread;
@@ -10,7 +10,11 @@ Diagnostics :: struct {
     pending: bool;
     quit: bool;
 
-    previously_errored_file: string;
+    previously_errored_files: [..]string;
+
+    harvest_output: string;
+    harvest_context: string;
+    harvest_ready: bool;
 }
 
 diagnostics: Diagnostics;
@@ -43,9 +47,28 @@ run_diagnostics :: () {
     signal(*diagnostics.wake);
 }
 
+apply_pending_harvest :: () {
+    lock(*diagnostics.lock);
+    ready := diagnostics.harvest_ready;
+    output := diagnostics.harvest_output;
+    context_path := diagnostics.harvest_context;
+    diagnostics.harvest_ready = false;
+    diagnostics.harvest_output = "";
+    diagnostics.harvest_context = "";
+    unlock(*diagnostics.lock);
+
+    if !ready return;
+
+    harvest_compiler_types(output, context_path);
+    free(output);
+    free(context_path);
+}
+
 #scope_file
 
 diagnostics_thread_proc :: (thread: *Thread) -> s64 {
+    context.logger = lsp_log;
+
     while true {
         wait_for(*diagnostics.wake);
 
@@ -87,20 +110,82 @@ resolve_jai_executable :: () -> string, bool {
 }
 
 reset_diagnostics :: () {
-    if diagnostics.previously_errored_file {
+    for diagnostics.previously_errored_files {
         lsp_send(LSP_Client_Message(LSP_Publish_Diagnostics).{
             method="textDocument/publishDiagnostics",
             params = .{
-                uri = diagnostics.previously_errored_file,
+                uri = it,
                 diagnostics = LSP_Diagnostic.[]
             }
         });
+
+        free(it);
     }
+
+    array_reset(*diagnostics.previously_errored_files);
 }
 
-// Currently, parse only the first error (maybe parsing multiple errors is not that useful because Jai mostly report one error at a time)
-// @TODO: Make it work with multiple errors
-// @todo: add support for warnings
+stage_harvest :: (output: string, context_path: string) {
+    lock(*diagnostics.lock);
+    defer unlock(*diagnostics.lock);
+
+    free(diagnostics.harvest_output);
+    free(diagnostics.harvest_context);
+
+    diagnostics.harvest_output = copy_string(output);
+    diagnostics.harvest_context = copy_string(context_path);
+    diagnostics.harvest_ready = true;
+}
+
+TYPE_MARKER :: "JAILS_TYPE|";
+DECL_MARKER :: "JAILS_DECL|";
+
+harvest_compiler_types :: (output: string, context_path: string) {
+    sources: [..]string;
+    sources.allocator = temp;
+
+    declarations: [..]string;
+    declarations.allocator = temp;
+
+    for line: split(output, "\n",, temp) {
+        if begins_with(line, TYPE_MARKER) {
+            array_add(*sources, advance(line, TYPE_MARKER.count));
+            continue;
+        }
+
+        if begins_with(line, DECL_MARKER) array_add(*declarations, line);
+    }
+
+    if sources.count == 0 return;
+
+    types := parse_harvested_types(sources, context_path);
+
+    for line: declarations {
+        parts := split(line, "|",, temp);
+        if parts.count < 5 continue;
+
+        line_number, line_ok := parse_int(*parts[3], int);
+        if !line_ok continue;
+        line_number -= 1;
+
+        type_id, id_ok := parse_int(*parts[4], u64);
+        if !id_ok continue;
+
+        found, harvested_type := table_find(*types, type_id);
+        if !found continue;
+
+        harvested: Harvested_Declaration;
+        harvested.name = copy_string(parts[1],, pool_alloc(*server.harvest_pool));
+        harvested.file = copy_string(normalize_path(parts[2],, temp),, pool_alloc(*server.harvest_pool));
+        harvested.type = harvested_type;
+
+        table_add(*server.harvested_decls,
+            harvested_decl_key(harvested.file, line_number, harvested.name), harvested);
+    }
+
+    log("Harvest mapped % declarations to compiler types", server.harvested_decls.count);
+}
+
 run_diagnostics_now :: () {
     if server.build_root.count == 0 return;
     build_root_absolute := join(server.project_root, server.build_root, separator="/");
@@ -137,100 +222,159 @@ run_diagnostics_now :: () {
         array_add(*command, "-intermediate_path", normalised);
     }
 
+    array_add(*command, "-project_root", server.project_root);
+
     array_add(*command, "---", "import_dir", server.diagnostics_metaprogram_path);
+
+    result, output, error := run_command(..command, working_directory=server.project_root, capture_and_return_output=true, timeout_ms=DIAGNOSTICS_TIMEOUT_MS);
+    defer free(output);
+    defer free(error);
+
+    if result.type == .FAILED_TO_LAUNCH {
+        log_error("Diagnostics could not launch the compiler (%)", jai_exe_path);
+        return;
+    }
+
+    if result.type != .EXITED {
+        log_error("Diagnostics compiler run did not finish within %ms, keeping the previous diagnostics", DIAGNOSTICS_TIMEOUT_MS);
+        return;
+    }
 
     reset_diagnostics();
 
-    result, _, error, timeout_reached := run_command(..command, working_directory=server.project_root, capture_and_return_output=true, timeout_ms=DIAGNOSTICS_TIMEOUT_MS);
-    if timeout_reached {
-        log_error("Diagnostics: the compiler did not finish within % ms, skipping diagnostics for this run.", DIAGNOSTICS_TIMEOUT_MS);
-        return;
+    stage_harvest(output, normalize_path(build_root_absolute,, temp));
+
+    File_Diagnostic :: struct {
+        file: string;
+        diagnostic: LSP_Diagnostic;
+        published: bool;
     }
 
-    if result.type == .FAILED_TO_LAUNCH {
-        log_error("Diagnostics: failed to launch the compiler (%).", command[0]);
-        return;
-    }
-
-    if result.exit_code == 0 {
-        return;
-    }
+    parsed: [..]File_Diagnostic;
+    parsed.allocator = temp;
 
     lines := split(error, "\n");
     defer array_free(lines);
 
-    file: string;
-    diagnostic: LSP_Diagnostic;
+    ERROR_MARKER   :: ": Error:";
+    WARNING_MARKER :: ": Warning:";
+    INFO_MARKER    :: ": Info:";
+    CONTINUATION_MARKER :: ": ...";
 
-    ERROR_MARKER :: ": Error:";
-    // Get the first error
-    for output_line: lines {
-        if !contains(output_line, ERROR_MARKER) continue;
-
-        message_index := find_index_from_right(output_line, ERROR_MARKER);
-        message := slice(output_line, message_index + ERROR_MARKER.count, output_line.count - message_index);
-        rest := slice(output_line, 0, message_index);
-
-        ok: bool;
-        location: string;
-        ok, file, location = split_from_right(rest, ":");
+    parse_location :: (rest: string) -> (ok: bool, file: string, line: u32, character: u32) {
+        ok, file, location := split_from_right(rest, ":");
+        if !ok return false, "", 0, 0;
         file = replace(file, "//", "/",, temp);
-        if !ok continue;
 
         line_and_character := split(location, ",");
-        if line_and_character.count < 2 continue;
+        if line_and_character.count < 2 return false, "", 0, 0;
 
         line, l_ok := parse_int(*line_and_character[0], u32);
-        if !l_ok continue;
+        if !l_ok return false, "", 0, 0;
 
         character, c_ok := parse_int(*line_and_character[1], u32);
-        if !c_ok continue;
+        if !c_ok return false, "", 0, 0;
 
-        diagnostic.message = message;
-        diagnostic.severity = xx LSP_Diagnostic_Severity.ERROR;
-
-        diagnostic.range.start.line = line-1;
-        diagnostic.range.start.character = character-1;
+        return true, file, line, character;
     }
 
-    if file.count == 0 {
-        log_error("Diagnostics: the compiler failed without a locatable error:\n%", error);
+    extent_target := -1;
+
+    for output_line: lines {
+        marker := "";
+        severity: LSP_Diagnostic_Severity;
+
+        if contains(output_line, ERROR_MARKER) {
+            marker = ERROR_MARKER;
+            severity = .ERROR;
+        } else if contains(output_line, WARNING_MARKER) {
+            marker = WARNING_MARKER;
+            severity = .WARNING;
+        }
+
+        if marker {
+            message_index := find_index_from_right(output_line, marker);
+            message := slice(output_line, message_index + marker.count, output_line.count - message_index);
+            ok, file, line, character := parse_location(slice(output_line, 0, message_index));
+            if !ok continue;
+
+            diagnostic: LSP_Diagnostic;
+            diagnostic.message = trim(message);
+            diagnostic.severity = xx severity;
+            diagnostic.range.start.line = line-1;
+            diagnostic.range.start.character = character-1;
+            diagnostic.range.end = diagnostic.range.start;
+
+            array_add(*parsed, .{file=file, diagnostic=diagnostic});
+            extent_target = parsed.count-1;
+            continue;
+        }
+
+        annotation_index := find_index_from_left(output_line, INFO_MARKER);
+        if annotation_index < 0 {
+            annotation_index = find_index_from_left(output_line, CONTINUATION_MARKER);
+        }
+
+        if annotation_index >= 0 {
+            ok := parse_location(slice(output_line, 0, annotation_index));
+            if ok && parsed.count > 0 {
+                last := *parsed[parsed.count-1];
+                last.diagnostic.message = tprint("%\n%", last.diagnostic.message, trim(output_line));
+            }
+
+            extent_target = -1;
+            continue;
+        }
+
+        if extent_target >= 0 {
+            trimmed := trim(output_line);
+            if trimmed.count > 0 {
+                only_carets := true;
+                for char: cast([]u8) trimmed {
+                    if char != #char "^" {
+                        only_carets = false;
+                        break;
+                    }
+                }
+
+                if only_carets {
+                    target := *parsed[extent_target].diagnostic;
+                    target.range.end.character = target.range.start.character + cast(u32) trimmed.count;
+                    extent_target = -1;
+                }
+            }
+        }
+    }
+
+    if parsed.count == 0 {
+        if result.exit_code != 0 {
+            log_error("Diagnostics compile failed (exit code %) but no errors could be parsed from the output", result.exit_code);
+        }
         return;
     }
 
-    highlight_found := false;
-    highlighted_chars: u32;
+    for i: 0..parsed.count-1 {
+        if parsed[i].published continue;
 
-    for line: lines {
-        if highlight_found || !contains(line, #char "^") continue;
+        file_diagnostics: [..]LSP_Diagnostic;
+        file_diagnostics.allocator = temp;
 
-        for char: cast([]u8) line {
-            if char != #char "^" continue;
-            highlighted_chars += 1;
+        for j: i..parsed.count-1 {
+            if parsed[j].file != parsed[i].file continue;
+            array_add(*file_diagnostics, parsed[j].diagnostic);
+            parsed[j].published = true;
         }
 
-        highlight_found = true;
+        uri := path_to_lsp_path(normalize_path(parsed[i].file,, temp));
+
+        lsp_send(LSP_Client_Message(LSP_Publish_Diagnostics).{
+            method="textDocument/publishDiagnostics",
+            params = .{
+                uri = uri,
+                diagnostics = file_diagnostics
+            }
+        });
+
+        array_add(*diagnostics.previously_errored_files, uri);
     }
-
-    diagnostic.range.end.line = diagnostic.range.start.line;
-    diagnostic.range.end.character = diagnostic.range.start.character+highlighted_chars;
-
-    diagnostics_to_publish: [1]LSP_Diagnostic;
-    diagnostics_to_publish[0] = diagnostic;
-
-    file = path_to_lsp_path(normalize_path(file,, temp)); // split_from_right and slice don't allocate memory so copy the file in case the string with compiler output is freed
-
-    lsp_send(LSP_Client_Message(LSP_Publish_Diagnostics).{
-        method="textDocument/publishDiagnostics",
-        params = .{
-            uri = file,
-            diagnostics = diagnostics_to_publish
-        }
-    });
-
-    if file != diagnostics.previously_errored_file {
-        free(diagnostics.previously_errored_file);
-    }
-
-    diagnostics.previously_errored_file = file;
 }

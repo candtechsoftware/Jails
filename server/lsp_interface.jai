@@ -25,7 +25,7 @@ LSP_Request_Message :: struct {
 }
 
 LSP_Response_Error :: struct (Data_Type: Type) {
-    code: LSP_Error_Codes;
+    code: s32;
     message: string;
     data: Data_Type;
 }
@@ -492,12 +492,20 @@ LSP_Request_Message_Initialize :: struct {
 
 LSP_Result_Initialize :: struct {
     capabilities: struct {
-        //semanticTokensProvider := true;
+        semanticTokensProvider: struct {
+            legend: struct {
+                tokenTypes     := SEMANTIC_TOKEN_TYPES;
+                tokenModifiers := SEMANTIC_TOKEN_MODIFIERS;
+            };
+
+            full := true;
+        };
+
         documentSymbolProvider := true;
         workspaceSymbolProvider := true;
 
         definitionProvider := true;
-        // hoverProvider := true;
+        hoverProvider := true;
 
         signatureHelpProvider: struct {
             triggerCharacters   := string.["("];
@@ -519,6 +527,24 @@ LSP_Result_Initialize :: struct {
         name := "Jails";
         version := VERSION;
     };
+}
+
+MAX_COMPLETIONS :: 2000;
+
+LSP_Completion_List :: struct {
+    isIncomplete: bool;
+    items: []LSP_Completion_Item;
+}
+
+LSP_Request_Message_Semantic_Tokens :: struct {
+    using request: LSP_Request_Message;
+    params: struct {
+        textDocument: LSP_Text_Document_Identifier;
+    }
+}
+
+LSP_Semantic_Tokens :: struct {
+    data: []u32;
 }
 
 LSP_Request_Message_Definition :: struct {
@@ -583,6 +609,7 @@ LSP_Parameter_Information :: struct {
 
 LSP_Completion_Item :: struct {
     label: string;
+    sortText: string;
     detail: string;
     insertText: string;
     documentation: string;
@@ -631,9 +658,13 @@ LSP_Completion_Item :: struct {
     };
 }
 
+LSP_Markup_Content :: struct {
+    kind := "markdown";
+    value: string;
+}
+
 LSP_Hover :: struct {
-    contents: string;
-    contentFormat:= "markdown";
+    contents: LSP_Markup_Content;
 }
 
 LSP_Folding_Range_Client_Capabilities :: struct {
@@ -812,6 +843,6 @@ lsp_respond_with_error :: (id: JSON_Value, code: LSP_Error_Codes, message: strin
     };
 
     reply.id = id;
-    reply.error = .{code, message, data};
+    reply.error = .{xx code, message, data};
     lsp_send(reply);
 }

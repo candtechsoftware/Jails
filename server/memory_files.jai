@@ -53,6 +53,28 @@ remove_memory_file :: (file_path: string) {
     }
 }
 
+find_line_in_memory_file :: (file: string, position: LSP_Position) -> string {
+    lock(*server.memory_files_lock);
+    defer unlock(*server.memory_files_lock);
+
+    ok, content := table_find(*server.memory_files, file);
+    if !ok return "";
+
+    start := position_to_offset(content, .{line = position.line, character = 0});
+
+    stop := start;
+    while stop < content.count && content[stop] != #char "\n" stop += 1;
+
+    return to_string(content.data + start, stop - start);
+}
+
+is_memory_file :: (name: string) -> bool {
+    lock(*server.memory_files_lock);
+    defer unlock(*server.memory_files_lock);
+
+    return table_contains(*server.memory_files, name);
+}
+
 get_memory_file :: (name: string) -> []u8 {
     lock(*server.memory_files_lock);
     defer unlock(*server.memory_files_lock);
