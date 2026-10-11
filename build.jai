@@ -26,6 +26,8 @@
         options.output_path = "./bin";
         options.import_path = import_path;
 
+        #if #exists(JAILS_DIAGNOSTICS_BUILD) options.output_type = .NO_OUTPUT;
+
         if !release && CPU == .X64 {
             // Use the X64 backend
             options.backend = .X64;

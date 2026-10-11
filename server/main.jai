@@ -1,4 +1,4 @@
-VERSION :: "0.2.22";
+VERSION :: "0.2.23";
 
 MEMORY_DEBUG :: false;
 
@@ -29,9 +29,16 @@ Server :: struct {
     files_to_be_analyzed: [..]*Program_File;
 
     memory_files_lock: Mutex;
-    memory_files: Table(string, [..]u8); // @todo: This is probably dumb - store files as array of lines instead (is this good idea?) // @ToDo: Keep track of a modified flag per file
+    memory_files: Table(string, Memory_File);
 
     diagnostics_metaprogram_path: string;
+
+    context_pool: Pool;
+    context_struct: *Struct;
+    context_struct_built: bool;
+
+    harvest_pool: Pool;
+    harvested_decls: Table(u64, Harvested_Declaration);
 
     user_options: User_Options;
 }
@@ -379,7 +386,6 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
                 parse_file(tprint("%/modules/Preload.jai", server.args.jai_path), true);
             }
 
-
             analyze_files();
 
             to_send: LSP_Result_Initialize;
@@ -407,8 +413,10 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
 
             file_path := normalize_path(body.params.textDocument.uri,, temp);
 
-            parse_file(file_path, true);
-            analyze_files();
+            if !is_memory_file(file_path) {
+                parse_file(file_path, true);
+                analyze_files();
+            }
 
         case "textDocument/didOpen";
             success, body := json_parse_string(raw_request, LSP_Did_Open_Text_Document,, temp);
@@ -423,7 +431,8 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
 
             create_memory_file(file_path, content);
 
-            parse_file(file_path);
+            parse_file(file_path, true);
+            parse_local_module_for_file(file_path);
             analyze_files();
             // run_diagnostics();
 
@@ -437,9 +446,10 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             }
 
             file_path := normalize_path(body.params.textDocument.uri,, temp);
-            edit_memory_file(file_path, body.params.contentChanges);
-            parse_file(file_path, true);
-            analyze_files();
+            if edit_memory_file(file_path, body.params.contentChanges) {
+                parse_file(file_path, true);
+                analyze_files();
+            }
 
         case "textDocument/documentSymbol";
             success, body := json_parse_string(raw_request, LSP_Request_Message_Document_Symbol,, temp);
@@ -473,6 +483,15 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             file_path := normalize_path(body.params.textDocument.uri,, temp);
             remove_memory_file(file_path);
 
+        case "textDocument/semanticTokens/full";
+            success, body := json_parse_string(raw_request, LSP_Request_Message_Semantic_Tokens,, temp);
+            if !success {
+                log_error("Unable to parse % message", request.method);
+                return;
+            }
+
+            handle_semantic_tokens(body.id, body.params.textDocument.uri);
+
         case "textDocument/completion";
             success, body := json_parse_string(raw_request, LSP_Request_Message_Completion,, temp);
             if !success {
@@ -492,13 +511,23 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             handle_signature_help(body);
 
         case "textDocument/hover";
-            // success, body := json_parse_string(raw_request, LSP_Request_Message_Hover,, temp);
-            // if !success {
-            //     log_error("Unable to parse textDocument/completion message");
-            //     return;
-            // }
+            success, body := json_parse_string(raw_request, LSP_Request_Message_Hover,, temp);
+            if !success {
+                log_error("Unable to parse textDocument/hover message");
+                return;
+            }
 
-            // handle_hover(body);
+            handle_hover(body);
+
+        case "exit";
+            server.quit = true;
+
+        case;
+            if request.id.type == .NULL return;
+
+            log("Unhandled method: %", request.method);
+            lsp_respond_with_error(request.id, .METHOD_NOT_FOUND,
+                tprint("Unknown method '%'", request.method), JSON_Value.{});
     }
 }
 
@@ -527,6 +556,7 @@ main :: () {
     log("Args are %", server.args);
 
     defer deinit(*server.files);
+    defer for file: server.files release(*file.completion_pool);
 
     server.files_to_be_analyzed.allocator = context.default_allocator;
 
@@ -539,6 +569,7 @@ main :: () {
     start_parent_watchdog();
 
     while !server.quit {
+        defer reset_temporary_storage();
         body, success, closed := read_message_from_stdin(,, temp);
         if closed {
             // The editor closed our stdin. Without this we would spin here forever at 100% CPU.
@@ -550,6 +581,8 @@ main :: () {
             continue;
         }
 
+        apply_pending_harvest();
+
         parseOK, request := json_parse_string(body, LSP_Request_Message,, temp);
         if !parseOK {
             log_error("Unable to parse as json:\n%\n\n", body);
@@ -558,12 +591,11 @@ main :: () {
 
         handle_request(request, body);
 
-        reset_temporary_storage();
         #if MEMORY_DEBUG report_memory_leaks();
     }
 
     log("Shutdown");
-    exit(0);
+    return;
 }
 
 #import "Compiler";
@@ -577,6 +609,7 @@ main :: () {
 #import "String";
 #import "Shared_Memory_Channel";
 #import "Hash_Table";
+#import "Hash";
 #import "Random";
 #import "Process";
 #import "Reflection";
@@ -597,6 +630,7 @@ main :: () {
 #load "signature_help.jai";
 #load "hover.jai";
 #load "symbols.jai";
+#load "semantic_tokens.jai";
 #load "utils.jai";
 
 #if OS == .WINDOWS {

@@ -10,19 +10,37 @@ Resolved_Load :: struct {
     target: *Program_File;
 }
 
-Program_File :: struct {
-    path: string;
+Parsed_Ast :: struct {
     imports: [..]Module_Import;
     loads: [..]Resolved_Load;
+    usings: [..]*Using;
+    add_contexts: [..]*Directive_Add_Context;
     nodes: [..]*Node;
-    global_block: Block;
     declarations: Table(string, *Declaration);
     comments: [..]Comment_Token;
-    // resolved_identifiers: Table(*Identifier, []*Declaration);
+    tokens: [..]Token;
+    global_members: []*Node;
+    has_syntax_errors: bool;
+}
+
+Program_File :: struct {
+    path: string;
+    using ast: Parsed_Ast;
+
+    global_block: Block;
     linked_files: []Linked_File; // @TODO: this is probably stupid name for this!
 
-    ast_pool: Pool;
+    global_scope: Table(string, *Declaration);
+    global_scope_built: bool;
+
+    ast_pools: [2]Pool;
+    ast_pool_index: int;
+
     analysis_pool: Pool;
+
+    completion_pool: Pool;
+    completion_descriptions: Table(*Declaration, string);
+    completion_description_bytes: int;
 }
 
 Linked_File :: struct {
@@ -40,6 +58,10 @@ empty_identifier := Identifier.{
 
 s64_node := Identifier.{
     name = "s64",
+};
+
+u8_node := Identifier.{
+    name = "u8",
 };
 
 void_star_node := Identifier.{
@@ -66,17 +88,6 @@ array_count_declaration := Declaration.{
 //     release(*file.ast_pool);
 //     release(*file.analysis_pool);
 // }
-
-reset_file :: (using file: *Program_File) {
-    table_reset(*declarations);
-    array_reset(*nodes);
-    array_reset(*loads);
-    array_reset(*imports);
-    array_reset(*comments);
-    global_block.members.data = null;
-    global_block.members.count = 0;
-    release(*file.ast_pool);
-}
 
 get_file :: (path: string) -> *Program_File {
     ok, file := table_find(*server.files, path);
@@ -131,6 +142,41 @@ pool_alloc :: (pool: *Pool) -> Allocator {
     return .{pool_allocator_proc, pool};
 }
 
+parse_into_file :: (file: *Program_File, content: string, path_without_filename: string) {
+    parser: Parser(Node_Visit_Data);
+    parser.user_data.allocator = context.allocator;
+    parser.user_data.file = file;
+    parser.user_data.path_without_filename = path_without_filename;
+    parser.node_visit = node_visit;
+    parser.lexer = *create_lexer(content, file.path);
+
+    while !end(parser.lexer) {
+        parse(*parser, null);
+    }
+
+    file.global_members = parser.user_data.global_members;
+    file.comments = parser.lexer.comments;
+    file.tokens = parser.lexer.tokens;
+    file.has_syntax_errors = parser.lexer.has_syntax_errors;
+}
+
+parse_local_module_for_file :: (file_path: string) {
+    for folder: server.local_modules {
+        root := folder;
+        if !is_absolute_path(root) root = join(server.project_root, root, separator="/",, temp);
+        root = normalize_path(root,, temp);
+        prefix := join(trim_right(root, "/"), "/",, temp);
+        if !begins_with(file_path, prefix) continue;
+
+        end := prefix.count;
+        while end < file_path.count && file_path[end] != #char "/" end += 1;
+        if end == file_path.count continue;
+
+        module_path := join(slice(file_path, 0, end), "module.jai", separator="/",, temp);
+        if file_exists(module_path) parse_file(module_path);
+    }
+}
+
 parse_file :: (input_path: string, force := false) {
     // Reset back to default allocator, we dont want to use pool from "parent" file...
     push_allocator(context.default_allocator);
@@ -145,10 +191,11 @@ parse_file :: (input_path: string, force := false) {
 
     // log("Parse file: %", path);
 
-    content := cast(string) get_memory_file(path);
+    memory_content, in_memory := get_memory_file(path);
+    content := cast(string) memory_content;
     content_from_file: bool;
 
-    if content.count == 0 {
+    if !in_memory {
         exists: bool;
 
         content, exists = read_entire_file(path, log_errors=false);
@@ -160,37 +207,48 @@ parse_file :: (input_path: string, force := false) {
         content_from_file = true;
     }
 
-    if ok {
-        reset_file(file); // clear old data
-    } else {
+    if !ok {
         file = New(Program_File);
         file.path = copy_string(path);
-        set_allocators(*file.ast_pool, context.default_allocator);
+        set_allocators(*file.ast_pools[0], context.default_allocator);
+        set_allocators(*file.ast_pools[1], context.default_allocator);
         set_allocators(*file.analysis_pool, context.default_allocator);
+        set_allocators(*file.completion_pool, context.default_allocator);
         table_add(*server.files, file.path, file);
     }
 
-    path_without_filename := trim_right(path_strip_filename(file.path), "/");
+    path_without_filename := normalize_path(trim_right(path_strip_filename(file.path), "/"));
+
+    release(*file.completion_pool);
+    file.completion_descriptions = .{};
+    file.completion_descriptions.allocator = pool_alloc(*file.completion_pool);
+    file.completion_description_bytes = 0;
+
+    previous := file.ast;
+    previous_index := file.ast_pool_index;
+
+    next_index := ifx ok then 1 - previous_index else previous_index;
+    next_pool := *file.ast_pools[next_index];
+    release(next_pool);
+
+    file.ast = .{};
 
     {
-        _pool := pool_alloc(*file.ast_pool);
-
-        push_allocator(_pool);
-
-        parser: Parser(Node_Visit_Data);
-        parser.user_data.allocator = _pool;
-        parser.user_data.file = file;
-        parser.user_data.path_without_filename = normalize_path(path_without_filename);
-        parser.node_visit = node_visit;
-        parser.lexer = *create_lexer(content, file.path);
-
-        while !end(parser.lexer) {
-            parse(*parser, null);
-        }
-
-        file.global_block.members = parser.user_data.global_members;
-        file.comments = parser.lexer.comments;
+        push_allocator(pool_alloc(next_pool));
+        parse_into_file(file, content, path_without_filename);
     }
+
+    keep_previous := file.has_syntax_errors && file.nodes.count == 0 && previous.nodes.count > 0;
+
+    if keep_previous {
+        file.ast = previous;
+        release(next_pool);
+    } else {
+        if ok release(*file.ast_pools[previous_index]);
+        file.ast_pool_index = next_index;
+    }
+
+    file.global_block.members = file.global_members;
 
     if content_from_file free(content);
     // log("Parsed: % (nodes: %, declarations: %, pointer: %)", path, file.nodes.count, file.declarations.count, file);
@@ -208,6 +266,76 @@ parse_file :: (input_path: string, force := false) {
     }
 }
 
+Harvested_Declaration :: struct {
+    name: string;
+    file: string;
+    type: *Struct;
+}
+
+parse_harvested_types :: (sources: []string, context_path: string) -> Table(u64, *Struct) {
+    push_allocator(context.default_allocator);
+
+    types: Table(u64, *Struct);
+
+    release(*server.harvest_pool);
+    set_allocators(*server.harvest_pool, context.default_allocator);
+    table_reset(*server.harvested_decls);
+
+    if sources.count == 0 return types;
+
+    builder: String_Builder;
+    for sources {
+        append(*builder, it);
+        append(*builder, "\n");
+    }
+
+    push_allocator(pool_alloc(*server.harvest_pool));
+
+    source := builder_to_string(*builder);
+
+    harvest_file := New(Program_File);
+    harvest_file.path = copy_string(context_path);
+
+    parse_into_file(harvest_file, source, "");
+
+    HARVEST_PREFIX :: "Jails_Harvested_";
+
+    for node: harvest_file.nodes {
+        if node.kind != .DECLARATION continue;
+
+        decl := cast(*Declaration) node;
+        if !decl.expression || decl.expression.kind != .STRUCT continue;
+        if !begins_with(decl.name, HARVEST_PREFIX) continue;
+
+        id_text := advance(decl.name, HARVEST_PREFIX.count);
+        type_id, ok := parse_int(*id_text, u64);
+        if !ok continue;
+
+        table_set(*types, type_id, cast(*Struct) decl.expression);
+    }
+
+    log("Harvested % struct types from the compiler", types.count);
+    return types;
+}
+
+harvested_decl_key :: (file: string, line: int, name: string) -> u64 {
+    return fnv1a_hash(cast(u64) line, fnv1a_hash(name.data, name.count, fnv1a_hash(file.data, file.count)));
+}
+
+get_harvested_type :: (decl: *Declaration) -> *Node {
+    if server.harvested_decls.count == 0 return null;
+    if decl.name.count == 0 return null;
+
+    found, harvested := table_find(*server.harvested_decls,
+        harvested_decl_key(decl.location.file, decl.location.l0, decl.name));
+    if !found return null;
+
+    if harvested.name != decl.name return null;
+    if harvested.file != decl.location.file return null;
+
+    return harvested.type;
+}
+
 resolve_file_graph :: () {
     for file: server.files {
         for *imp: file.imports {
@@ -222,7 +350,15 @@ resolve_file_graph :: () {
 analyze_files :: () {
     for file: server.files_to_be_analyzed {
         release(*file.analysis_pool);
+
+        file.global_scope = .{};
+        file.global_scope_built = false;
     }
+
+    release(*server.context_pool);
+    set_allocators(*server.context_pool, context.default_allocator);
+    server.context_struct = null;
+    server.context_struct_built = false;
 
     resolve_file_graph();
 
@@ -317,8 +453,14 @@ node_visit :: (node: *Node, data: Node_Visit_Data) {
         parse_file(path); // @TODO: Run this in another thread?
     }
 
+    if node.kind == .DIRECTIVE_ADD_CONTEXT {
+        array_add(*file.add_contexts, cast(*Directive_Add_Context) node);
+    }
+
     if node.kind == .USING {
         _using := cast(*Using) node;
+        array_add(*file.usings, _using);
+
         if _using.expression && _using.expression.kind == .DECLARATION {
             decl := cast(*Declaration) _using.expression;
             if decl.expression && decl.expression.kind == .DIRECTIVE_IMPORT {
@@ -486,6 +628,16 @@ get_file_links :: (file: *Program_File) -> [..]Linked_File {
     return linked_files;
 }
 
+enum_member_declaration :: (ident: *Identifier) -> *Declaration {
+    decl := New(Declaration);
+    decl.name = ident.name;
+    decl.expression = *empty_identifier;
+    decl.location = ident.location;
+    decl.const = true;
+    decl.parent = ident.parent;
+    return decl;
+}
+
 add_all_fields_of :: (decls: *[..]*Declaration, node: *Node, filter_name: string = "") {
     if !node return;
     if !enter_resolve() return;
@@ -502,12 +654,7 @@ add_all_fields_of :: (decls: *[..]*Declaration, node: *Node, filter_name: string
             case .IDENTIFIER;
                 ident := cast(*Identifier) member;
 
-                decl := New(Declaration); // @MEMORY: We should free this or it is temp?
-                decl.name = ident.name;
-                decl.expression = *empty_identifier;
-                decl.location = ident.location;
-                decl.const = true;
-
+                decl := enum_member_declaration(ident);
                 if !filter_name || filter_name == decl.name array_add(decls, decl);
 
             case .DECLARATION;
@@ -519,6 +666,11 @@ add_all_fields_of :: (decls: *[..]*Declaration, node: *Node, filter_name: string
 
             case .COMPOUND_DECLARATION;
                 compound_declaration_to_declarations(decls, cast(*Compound_Declaration) member, filter_name);
+
+            case .IF;
+                _if := cast(*If) member;
+                if _if._then add_all_fields_of(decls, _if._then, filter_name);
+                if _if._else add_all_fields_of(decls, _if._else, filter_name);
 
             case .DIRECTIVE_AS; #through;
             case .USING; // @TODO: handle `using` modifiers like `except`, `only` and `map`.
@@ -543,55 +695,93 @@ add_all_fields_of :: (decls: *[..]*Declaration, node: *Node, filter_name: string
 }
 
 // @TODO: Refactor this! (stupid global variable)
-skip_using: *Using;
+USINGS_IN_PROGRESS_MAX :: 64;
+usings_in_progress: [USINGS_IN_PROGRESS_MAX]*Using;
+usings_in_progress_count: int;
 
-add_decls_from_using :: (decls: *[..]*Declaration, _using: *Using, name: string) {
-    if skip_using == _using || !_using.expression || _using.expression.kind != .IDENTIFIER return;
+using_filter_allows :: (_using: *Using, decl_name: string) -> bool {
+    if _using.filter_type != .ONLY && _using.filter_type != .EXCEPT return true;
 
-    ident := cast(*Identifier) _using.expression;
+    listed := false;
+    for filter: _using.filters {
+        if filter.kind != .IDENTIFIER continue;
+        if (cast(*Identifier) filter).name == decl_name {
+            listed = true;
+            break;
+        }
+    }
 
-    copied_using := skip_using;
-    skip_using = _using;
-
-    used_type := get_node_type(_using.expression);
-    if !used_type return;
-
-    add_all_fields_of(decls, used_type, name);
-
-    skip_using = copied_using;
+    return ifx _using.filter_type == .ONLY then listed else !listed;
 }
 
-get_declarations_from_for :: (decls: *[..]*Declaration, node: *Node, from_loc: *Node.Location, name := "") {
-    _for := cast(*For) node;
+add_decls_from_using :: (decls: *[..]*Declaration, _using: *Using, name: string) {
+    if usings_in_progress_count >= USINGS_IN_PROGRESS_MAX return;
+
+    for 0..usings_in_progress_count-1 {
+        if usings_in_progress[it] == _using return;
+    }
+
+    used_expression := get_used_expression(_using);
+    if !used_expression return;
+
+    usings_in_progress[usings_in_progress_count] = _using;
+    usings_in_progress_count += 1;
+    defer usings_in_progress_count -= 1;
+
+    if used_expression.kind == .DECLARATION {
+        used_decl := cast(*Declaration) used_expression;
+        if name.count == 0 || name == used_decl.name array_add(decls, used_decl);
+    }
+
+    used_type := get_node_type(used_expression);
+    if !used_type return;
+
+    filtered: [..]*Declaration;
+    filtered.allocator = temp;
+
+    add_all_fields_of(*filtered, used_type, name);
+
+    for decl: filtered {
+        if using_filter_allows(_using, decl.name) array_add(decls, decl);
+    }
+}
+
+get_for_element_type :: (_for: *For) -> element_type: *Node, is_range: bool {
+    if !_for.iterator return null, false;
+
+    if _for.iterator.kind == .BINARY_OPERATION {
+        binary := cast(*Binary_Operation) _for.iterator;
+        if binary.operation == .RANGE return *s64_node, true;
+    }
 
     saved_skip_node := skip_node;
     defer skip_node = saved_skip_node;
     skip_node = _for;
-    iterator_type := get_node_type(_for.iterator, false);
-    if !iterator_type {
-        return;
-    }
 
-    element_type: *Node;
+    iterator_type := get_node_type(_for.iterator);
+    if !iterator_type return null, false;
 
     if iterator_type.kind == {
         case .ARRAY_TYPE;
-            array_type := cast(*Array_Type) iterator_type;
-            if !array_type.element_type {
-                return;
-            }
+            return (cast(*Array_Type) iterator_type).element_type, false;
 
-            element_type = array_type.element_type;
+        case .IDENTIFIER;
+            if (cast(*Identifier) iterator_type).name == "string" return *u8_node, false;
 
         case .LITERAL;
             literal := cast(*Literal) iterator_type;
-            if literal.value_type != .ARRAY {
-                return;
-            }
-
-            element_type = literal.array_literal_info.element_type;
+            if literal.value_type == .ARRAY  return literal.array_literal_info.element_type, false;
+            if literal.value_type == .STRING return *u8_node, false;
     }
 
+    return null, false;
+}
+
+get_declarations_from_for :: (decls: *[..]*Declaration, node: *Node, from_loc: *Node.Location, name := "") {
+    _for := cast(*For) node;
+    if !_for.iterator || !_for.body || !from_loc || !contains(_for.body.location, from_loc.*) return;
+
+    element_type, is_range := get_for_element_type(_for);
     if !element_type {
         element_type = *unknown_identifier_node;
     }
@@ -627,7 +817,10 @@ get_declarations_from_for :: (decls: *[..]*Declaration, node: *Node, from_loc: *
     }
 
     if name.count == 0 || it_declaration.name == name array_add(decls, it_declaration);
-    if name.count == 0 || it_index_decl.name == name array_add(decls, it_index_decl);
+
+    if !is_range || _for.index {
+        if name.count == 0 || it_index_decl.name == name array_add(decls, it_index_decl);
+    }
 }
 
 skip_node: *Node;
@@ -648,7 +841,7 @@ get_declarations_from_parent :: (decls: *[..]*Declaration, node: *Node, from_loc
 
             for _case.members {
                 // We only accept `nodes` if they were declared before our cursor location.
-                if from_loc.l0 < it.location.l0 continue;
+                if it.location.l0 > from_loc.l0 || (it.location.l0 == from_loc.l0 && it.location.c0 > from_loc.c0) continue;
 
                 if it.kind == {
                     case .USING;
@@ -661,13 +854,18 @@ get_declarations_from_parent :: (decls: *[..]*Declaration, node: *Node, from_loc
 
             }
 
-
         case .PROCEDURE;
             proc := cast(*Procedure) node;
 
             for arg: proc.arguments {
-                if arg.kind != .DECLARATION continue;
-                decl := cast(*Declaration) arg;
+                if arg.kind == .USING {
+                    add_decls_from_using(decls, cast(*Using) arg, name);
+                    continue;
+                }
+
+                unwrapped := unwrap_polymorphic_constant(arg);
+                if !unwrapped || unwrapped.kind != .DECLARATION continue;
+                decl := cast(*Declaration) unwrapped;
 
                 if name.count == 0 || decl.name == name array_add(decls, decl);
             }
@@ -711,7 +909,7 @@ get_declarations_from_parent :: (decls: *[..]*Declaration, node: *Node, from_loc
             for block.members {
 
                 // We only accept `nodes` if they were declared before our cursor/node location.
-                if from_loc.l0 < it.location.l0 continue;
+                if it.location.l0 > from_loc.l0 || (it.location.l0 == from_loc.l0 && it.location.c0 > from_loc.c0) continue;
 
                 if it.kind == {
                     case .USING; // @TODO: solve crash when having two using
@@ -749,11 +947,34 @@ get_declarations_from_parent :: (decls: *[..]*Declaration, node: *Node, from_loc
     get_declarations_from_parent(decls, node.parent, from_loc, name, only_consts);
 }
 
-get_declarations :: (file: *Program_File, from_node: *Node = null, from_loc: *Node.Location = null, name := "", only_loaded := false) -> []*Declaration {
+ensure_global_scope :: (file: *Program_File) -> bool {
+    if file.global_scope_built return true;
+    if !is_memory_file(file.path) return false;
+
+    file.global_scope.allocator = pool_alloc(*file.analysis_pool);
+
+    for linked_file: file.linked_files {
+        for decl: linked_file.file.declarations {
+            if !is_global(decl, file, linked_file.file, linked_file.from_import) continue;
+            table_add(*file.global_scope, decl.name, decl);
+        }
+    }
+
+    file.global_scope_built = true;
+    return true;
+}
+
+get_declarations :: (file: *Program_File, from_node: *Node = null, from_loc: *Node.Location = null, name := "", only_loaded := false, as_import := false) -> []*Declaration {
     decls: [..]*Declaration;
+
+    if from_node {
+        get_declarations_from_parent(*decls, from_node, from_loc, name, false);
+    }
 
     // Globals in all linked files (loaded or imported)
     if file {
+        cached := !only_loaded && !as_import && ensure_global_scope(file);
+
         for linked_file: file.linked_files {
             // log("Linked file: %", linked_file.file.path);
 
@@ -761,64 +982,37 @@ get_declarations :: (file: *Program_File, from_node: *Node = null, from_loc: *No
                 continue;
             }
 
-            // -- Global using --
-            // We are accepting usings only from loaded files.
-            // if !linked_file.from_import {
+            linked_from_import := linked_file.from_import || as_import;
 
-            //     // This is stupid!!
-            //     for linked_file.file.nodes {
-            //         if !is_global(it, file, linked_file.file, linked_file.from_import) {
-            //             continue;
-            //         }
+            if usings_in_progress_count == 0 {
+                for _using: linked_file.file.usings {
+                    if !is_global(_using, file, linked_file.file, linked_from_import) continue;
+                    add_decls_from_using(*decls, _using, name);
+                }
+            }
 
-            //         if it.kind != .USING {
-            //             continue;
-            //         }
-
-            //         _using := cast(*Using, it);
-
-            //         if skip_using == _using {
-            //             continue;
-            //         }
-
-            //         if !_using.expression {
-            //             continue;
-            //         }
-
-            //         copied_using := skip_using;
-            //         skip_using = _using;
-
-            //         used_type := get_node_type(_using.expression);
-            //         if !used_type continue;
-
-            //         add_all_fields_of(*decls, used_type, name);
-
-            //         skip_using = copied_using;
-            //     }
-            // }
+            if cached continue;
 
             // We are searching for specific decl
             if name.count > 0 {
                 for decl: table_find_multiple(*linked_file.file.declarations, name) {
-                    if is_global(decl, file, linked_file.file, linked_file.from_import) array_add(*decls, decl);
+                    if is_global(decl, file, linked_file.file, linked_from_import) array_add(*decls, decl);
                 }
             } else { // We are adding all globals decls
                 for decl: linked_file.file.declarations {
-                    if is_global(decl, file, linked_file.file, linked_file.from_import) array_add(*decls, decl);
+                    if is_global(decl, file, linked_file.file, linked_from_import) array_add(*decls, decl);
                 }
             }
         }
+
+        if cached {
+            if name.count > 0 {
+                for decl: table_find_multiple(*file.global_scope, name) array_add(*decls, decl);
+            } else {
+                for decl: file.global_scope array_add(*decls, decl);
+            }
+        }
     }
-
-    // Scopes, Procedures ... (parents)
-    // if from_block {
-
-    if from_node {
-        get_declarations_from_parent(*decls, from_node, from_loc, name, false);
-    }
-    // }
-
-    // @TODO: Maybe deduplicate stuff here? (global stuff vs local shadowing etc)
 
     return decls;
 }
@@ -878,7 +1072,7 @@ is_global :: (node: *Node, from_file: *Program_File, it_file: *Program_File, fro
 
         if directive_scope.scope_kind == .MODULE && !from_import return true;
         if directive_scope.scope_kind == .EXPORT return true;
-        if directive_scope.scope_kind == .FILE && from_file == it_file return true;
+        if directive_scope.scope_kind == .FILE && from_file == it_file && !from_import return true;
     }
 
     return false;
@@ -951,8 +1145,10 @@ is_avaiable_from :: (file: *Program_File, target: *Program_File, already_checked
             break;
         }
 
-        if is_avaiable_from(it.target, target, already_checked, loads_only) {
+        found, found_from_import := is_avaiable_from(it.target, target, already_checked, loads_only);
+        if found {
             loaded = true;
+            from_import = found_from_import;
             break;
         }
     }
@@ -1038,6 +1234,156 @@ get_identifier_decls :: (ident: *Identifier) -> []*Declaration {
     return get_declarations(file, ident, *ident.location, ident.name);
 }
 
+resolve_dot_member :: (ident: *Identifier) -> decl: *Declaration, is_path: bool {
+    if !ident || !ident.parent return null, false;
+
+    leaf_node: *Node = ident;
+    op: *Binary_Operation;
+    parent := leaf_node.parent;
+    while parent {
+        if parent.kind == {
+            case .BINARY_OPERATION;
+                binary := cast(*Binary_Operation) parent;
+                if binary.operation == .DOT {
+                    if binary.right == leaf_node {
+                        op = binary;
+                        break;
+                    }
+                }
+                if binary.left != leaf_node break;
+
+            case .ARRAY_SUBSCRIPT;
+                if (cast(*Array_Subscript) parent).expression != leaf_node break;
+
+            case .PROCEDURE_CALL;
+                if (cast(*Procedure_Call) parent).procedure != leaf_node break;
+
+            case .UNARY_OPERATION;
+                unary := cast(*Unary_Operation) parent;
+                if unary.operation != .POINTER_DEREFERENCE || unary.expression != leaf_node break;
+
+            case; break;
+        }
+        leaf_node = parent;
+        parent = parent.parent;
+    }
+
+    if !op return null, false;
+
+    receivers: [..]*Node;
+    child: *Node = op;
+    parent = op.parent;
+    while parent && parent.kind == .BINARY_OPERATION {
+        binary := cast(*Binary_Operation) parent;
+        if binary.operation == .DOT {
+            if binary.right != child break;
+            array_add(*receivers, binary.left);
+        } else if binary.left != child {
+            break;
+        }
+        child = parent;
+        parent = parent.parent;
+    }
+
+    path: [..]*Node;
+    for i: 0..receivers.count-1 append_completion_receiver_path(*path, receivers[receivers.count-1-i]);
+    append_completion_receiver_path(*path, op.left);
+
+    type := get_path_type(path);
+    if !type return null, true;
+
+    return get_member_in(type, ident), true;
+}
+
+resolve_enum_member_declaration :: (ident: *Identifier) -> *Declaration {
+    if !ident.parent || ident.parent.kind != .BLOCK return null;
+    if !ident.parent.parent || ident.parent.parent.kind != .ENUM return null;
+
+    return enum_member_declaration(ident);
+}
+
+resolve_named_member :: (ident: *Identifier) -> *Declaration {
+    if !ident.parent || ident.parent.kind != .BINARY_OPERATION return null;
+
+    binary_op := cast(*Binary_Operation) ident.parent;
+    if binary_op.right == ident || !binary_op.parent return null;
+
+    if binary_op.parent.kind == .PROCEDURE_CALL {
+        for get_procedures_for_call(cast(*Procedure_Call) binary_op.parent) {
+            decl := get_procedure_argument(it, -1, ident.name);
+            if decl return decl;
+        }
+    }
+
+    if binary_op.parent.kind == .LITERAL {
+        literal_type := get_struct_literal_type(cast(*Literal) binary_op.parent);
+        if literal_type return get_member_in(literal_type, ident);
+    }
+
+    return null;
+}
+
+resolve_implicit_member :: (ident: *Identifier) -> *Declaration {
+    if !ident.parent || ident.parent.kind != .UNARY_OPERATION return null;
+
+    unary_op := cast(*Unary_Operation) ident.parent;
+    if unary_op.operation != .DOT || !unary_op.parent return null;
+
+    type: *Node;
+    call, argument_node, argument_name := get_call_argument_context(unary_op);
+    if call type = get_argument_type_for_call(call, argument_node, argument_name);
+    if !type && unary_op.parent.kind == .BINARY_OPERATION type = get_node_type(unary_op.parent, 1);
+    if !type return null;
+
+    return get_member_in(type, ident);
+}
+
+resolve_procedure_call :: (ident: *Identifier) -> *Declaration {
+    if !ident.parent || ident.parent.kind != .PROCEDURE_CALL return null;
+
+    proc_call := cast(*Procedure_Call) ident.parent;
+    if proc_call.procedure != ident return null;
+
+    decls := get_identifier_decls(ident);
+    if decls.count == 0 return null;
+
+    procedures: [..]*Procedure;
+    procedures.allocator = temp;
+
+    for proc_decl: decls {
+        type := get_node_type(proc_decl, stop_at_procedure=true);
+        if !type || type.kind != .PROCEDURE {
+            remove proc_decl;
+            continue;
+        }
+
+        array_add(*procedures, cast(*Procedure) type);
+    }
+
+    if procedures.count == 0 return null;
+
+    best := get_best_overload_for_procedure_call(procedures, proc_call);
+
+    return decls[best];
+}
+
+resolve_cursor_declaration :: (ident: *Identifier) -> decl: *Declaration, handled: bool {
+    decl := resolve_enum_member_declaration(ident);
+    if !decl decl = resolve_named_member(ident);
+    if !decl decl = resolve_implicit_member(ident);
+    if decl return decl, true;
+
+    dot_member, is_dot_path := resolve_dot_member(ident);
+    if is_dot_path return dot_member, true;
+
+    decl = resolve_procedure_call(ident);
+    return decl, decl != null;
+}
+
+resolve_identifier :: (ident: *Identifier) -> *Declaration {
+    return select_first_decl(get_identifier_decls(ident), 0);
+}
+
 select_first_decl :: (decls: []*Declaration, level: int) -> *Declaration {
     if decls.count == 0 {
         return null;
@@ -1063,10 +1409,195 @@ enter_resolve :: () -> bool #expand {
     return true;
 }
 
-get_node_type :: (root: *Node, solve_array := false, select_decl := select_first_decl, stop_at_procedure := false) -> *Node {
-    if !enter_resolve() return null;
+Poly_Binding :: struct {
+    name: string;
+    node: *Node;
+}
 
+specialize_polymorphic_procedure :: (proc: *Procedure, call: *Procedure_Call) -> *Node {
+    if proc.returns.count == 0 return null;
+
+    bindings: [..]Poly_Binding;
+    bindings.allocator = temp;
+
+    for parameter, index: proc.arguments {
+        if index >= call.arguments.count break;
+
+        if parameter.kind == .POLYMORPHIC_CONSTANT {
+            bind_parameter_name(parameter, call.arguments[index], *bindings);
+            continue;
+        }
+
+        if parameter.kind != .DECLARATION continue;
+
+        parameter_type := (cast(*Declaration) parameter).type_inst;
+        if !mentions_polymorph(parameter_type) continue;
+
+        argument_type := get_node_type(call.arguments[index]);
+        if !argument_type continue;
+
+        unify_polymorph(parameter_type, argument_type, *bindings);
+    }
+
+    if bindings.count == 0 return null;
+
+    return_node := proc.returns[0].expression;
+    if return_node && return_node.kind == .DECLARATION return_node = (cast(*Declaration) return_node).type_inst;
+    if !return_node return null;
+
+    return substitute_type(return_node, bindings);
+}
+
+mentions_polymorph :: (node: *Node) -> bool {
+    if !node return false;
+
+    if node.kind == .POLYMORPHIC_CONSTANT return true;
+    if node.kind == .ARRAY_TYPE return mentions_polymorph((cast(*Array_Type) node).element_type);
+    if node.kind == .UNARY_OPERATION return mentions_polymorph((cast(*Unary_Operation) node).expression);
+
+    return false;
+}
+
+unify_polymorph :: (parameter_type: *Node, argument_type: *Node, bindings: *[..]Poly_Binding) {
+    if !parameter_type || !argument_type return;
+
+    if parameter_type.kind == .POLYMORPHIC_CONSTANT {
+        name_node := (cast(*Polymorphic_Constant) parameter_type).expression;
+        if name_node && name_node.kind == .IDENTIFIER {
+            array_add(bindings, .{(cast(*Identifier) name_node).name, argument_type});
+        }
+    } else if parameter_type.kind == .ARRAY_TYPE && argument_type.kind == .ARRAY_TYPE {
+        unify_polymorph((cast(*Array_Type) parameter_type).element_type, (cast(*Array_Type) argument_type).element_type, bindings);
+    } else if parameter_type.kind == .UNARY_OPERATION && argument_type.kind == .UNARY_OPERATION {
+        unify_polymorph((cast(*Unary_Operation) parameter_type).expression, (cast(*Unary_Operation) argument_type).expression, bindings);
+    }
+}
+
+make_poly_bindings :: (parameters: []*Node, arguments: []*Node) -> []Poly_Binding {
+    bindings: [..]Poly_Binding;
+    bindings.allocator = temp;
+
+    for parameter, index: parameters {
+        if index >= arguments.count break;
+        bind_parameter_name(parameter, arguments[index], *bindings);
+    }
+
+    return bindings;
+}
+
+bind_parameter_name :: (parameter: *Node, argument: *Node, bindings: *[..]Poly_Binding) {
+    unwrapped := unwrap_polymorphic_constant(parameter);
+    if !unwrapped || unwrapped.kind != .DECLARATION return;
+
+    array_add(bindings, .{(cast(*Declaration) unwrapped).name, argument});
+}
+
+substitute_in_struct :: (_struct: *Struct, bindings: []Poly_Binding) -> *Node {
+    if !_struct.block return _struct;
+
+    members: [..]*Node;
+    substituted_any := false;
+
+    for member: _struct.block.members {
+        if member.kind != .DECLARATION {
+            array_add(*members, member);
+            continue;
+        }
+
+        decl := cast(*Declaration) member;
+        new_type := substitute_type(decl.type_inst, bindings);
+
+        if new_type == decl.type_inst {
+            array_add(*members, member);
+            continue;
+        }
+
+        copy := New(Declaration);
+        copy.* = decl.*;
+        copy.type_inst = new_type;
+
+        array_add(*members, copy);
+        substituted_any = true;
+    }
+
+    if !substituted_any return _struct;
+
+    block_copy := New(Block);
+    block_copy.* = _struct.block.*;
+    block_copy.members = members;
+
+    struct_copy := New(Struct);
+    struct_copy.* = _struct.*;
+    struct_copy.block = block_copy;
+
+    return struct_copy;
+}
+
+substitute_type :: (node: *Node, bindings: []Poly_Binding) -> *Node {
+    if !node return node;
+
+    if node.kind == .IDENTIFIER {
+        name := (cast(*Identifier) node).name;
+        for binding: bindings {
+            if binding.name == name return binding.node;
+        }
+
+        return node;
+    }
+
+    if node.kind == .ARRAY_TYPE {
+        array_type := cast(*Array_Type) node;
+
+        element := substitute_type(array_type.element_type, bindings);
+        if element == array_type.element_type return node;
+
+        copy := New(Array_Type);
+        copy.* = array_type.*;
+        copy.element_type = element;
+        return copy;
+    }
+
+    if node.kind == .UNARY_OPERATION {
+        unary := cast(*Unary_Operation) node;
+        if unary.operation != .POINTER return node;
+
+        expression := substitute_type(unary.expression, bindings);
+        if expression == unary.expression return node;
+
+        copy := New(Unary_Operation);
+        copy.* = unary.*;
+        copy.expression = expression;
+        return copy;
+    }
+
+    if node.kind == .PROCEDURE_CALL {
+        call := cast(*Procedure_Call) node;
+
+        arguments: [..]*Node;
+        substituted_any := false;
+
+        for argument: call.arguments {
+            new_argument := substitute_type(argument, bindings);
+            if new_argument != argument substituted_any = true;
+
+            array_add(*arguments, new_argument);
+        }
+
+        if !substituted_any return node;
+
+        copy := New(Procedure_Call);
+        copy.* = call.*;
+        copy.arguments = arguments;
+        return copy;
+    }
+
+    return node;
+}
+
+get_node_type :: (root: *Node, array_depth := 0, select_decl := select_first_decl, stop_at_procedure := false) -> *Node {
     current_node: *Node = root;
+
+    pending_call: *Procedure_Call;
 
     level: int;
     while true {
@@ -1080,8 +1611,18 @@ get_node_type :: (root: *Node, solve_array := false, select_decl := select_first
 
         // log("Resolving type: % (%:%:%)", current_node.kind, current_node.location.file, current_node.location.l0, current_node.location.c0);
 
+        if current_node.kind == .DIRECTIVE_CONTEXT {
+            return get_context_struct();
+        }
+
         if current_node.kind == .IDENTIFIER {
             ident := cast(*Identifier, current_node);
+
+            if ident.name == "context" {
+                context_struct := get_context_struct();
+                if context_struct return context_struct;
+            }
+
             ident_decls := get_identifier_decls(ident);
 
             if ident_decls.count == 0 {
@@ -1095,6 +1636,15 @@ get_node_type :: (root: *Node, solve_array := false, select_decl := select_first
         }
 
         if current_node.kind == .STRUCT {
+            _struct := cast(*Struct) current_node;
+
+            if pending_call && _struct.polymorphic_arguments.count > 0 {
+                bindings := make_poly_bindings(_struct.polymorphic_arguments, pending_call.arguments);
+                pending_call = null;
+
+                if bindings.count > 0 return substitute_in_struct(_struct, bindings);
+            }
+
             return current_node;
         }
 
@@ -1112,6 +1662,7 @@ get_node_type :: (root: *Node, solve_array := false, select_decl := select_first
 
         if current_node.kind == .ARRAY_SUBSCRIPT {
             array_subscript := cast(*Array_Subscript) current_node;
+            array_depth += 1;
             current_node = array_subscript.expression;
             continue;
         }
@@ -1119,12 +1670,13 @@ get_node_type :: (root: *Node, solve_array := false, select_decl := select_first
         if current_node.kind == .ARRAY_TYPE {
             array_type := cast(*Array_Type, current_node);
 
-            if solve_array {
+            if array_depth > 0 && array_type.element_type {
+                array_depth -= 1;
                 current_node = array_type.element_type;
                 continue;
-            } else {
-                return array_type;
             }
+
+            return array_type;
         }
 
         if current_node.kind == .LITERAL {
@@ -1138,10 +1690,19 @@ get_node_type :: (root: *Node, solve_array := false, select_decl := select_first
                         continue;
                     }
 
+                    if literal.parent && literal.parent.kind == .DECLARATION {
+                        decl := cast(*Declaration) literal.parent;
+                        if decl.type_inst && decl.type_inst != literal {
+                            current_node = decl.type_inst;
+                            continue;
+                        }
+                    }
+
                 case .ARRAY;
                     array_literal_info := literal.values.array_literal_info;
 
-                    if solve_array && array_literal_info.element_type {
+                    if array_depth > 0 && array_literal_info.element_type {
+                        array_depth -= 1;
                         current_node = array_literal_info.element_type;
                         continue;
                     } else {
@@ -1155,6 +1716,12 @@ get_node_type :: (root: *Node, solve_array := false, select_decl := select_first
 
         if current_node.kind == .DECLARATION {
             decl := cast(*Declaration) current_node;
+
+            harvested := get_harvested_type(decl);
+            if harvested {
+                current_node = harvested;
+                continue;
+            }
 
             if decl.type_inst {
                 current_node = decl.type_inst;
@@ -1199,6 +1766,9 @@ get_node_type :: (root: *Node, solve_array := false, select_decl := select_first
 
         if current_node.kind == .PROCEDURE_CALL {
             proc_call := cast(*Procedure_Call) current_node;
+
+            if proc_call.arguments.count > 0 pending_call = proc_call;
+
             current_node = proc_call.procedure;
             continue;
         }
@@ -1208,6 +1778,16 @@ get_node_type :: (root: *Node, solve_array := false, select_decl := select_first
 
             if stop_at_procedure {
                 return proc;
+            }
+
+            if pending_call {
+                specialized := specialize_polymorphic_procedure(proc, pending_call);
+                pending_call = null;
+
+                if specialized {
+                    current_node = specialized;
+                    continue;
+                }
             }
 
             if proc.returns.count > 0 {
@@ -1252,6 +1832,24 @@ get_node_type :: (root: *Node, solve_array := false, select_decl := select_first
                 continue;
             }
 
+            if unary_op.operation == .ELLIPSIS {
+                if !unary_op.expression {
+                    break;
+                }
+
+                if array_depth > 0 {
+                    array_depth -= 1;
+                    current_node = unary_op.expression;
+                    continue;
+                }
+
+                varargs_array := New(Array_Type);
+                varargs_array.element_type = unary_op.expression;
+                varargs_array.location = unary_op.location;
+
+                return varargs_array;
+            }
+
             break;
         }
 
@@ -1293,6 +1891,7 @@ unwrap_pointer :: (unary_op: *Unary_Operation) -> *Node {
 }
 
 get_block_of :: (node: *Node) -> *Block {
+    if !node return null;
     if node.kind == .BLOCK return cast(*Block) node;
 
     if node.kind == {
@@ -1305,6 +1904,43 @@ get_block_of :: (node: *Node) -> *Block {
 }
 
 // This depends on Preload having this type. We need to keep this in sync with the compiler.
+get_context_struct :: () -> *Struct {
+    if server.context_struct_built return server.context_struct;
+
+    server.context_struct_built = true;
+
+    runtime_support := search_for_file("modules/Runtime_Support.jai");
+    if !runtime_support return null;
+
+    ok, base_decl := table_find(*runtime_support.declarations, "Context_Base");
+    if !ok || !base_decl.expression || base_decl.expression.kind != .STRUCT return null;
+
+    base := cast(*Struct) base_decl.expression;
+    if !base.block return null;
+
+    push_allocator(pool_alloc(*server.context_pool));
+
+    members: [..]*Node;
+    array_add(*members, ..base.block.members);
+
+    for file: server.files {
+        for add_context: file.add_contexts {
+            if add_context.expression array_add(*members, add_context.expression);
+        }
+    }
+
+    block := New(Block);
+    block.members = members;
+    block.location = base.location;
+
+    _struct := New(Struct);
+    _struct.block = block;
+    _struct.location = base_decl.location;
+
+    server.context_struct = _struct;
+    return _struct;
+}
+
 get_internal_array_struct :: (resizable: bool) -> *Struct {
     preload := search_for_file("modules/Preload.jai");
     if !preload {
@@ -1348,20 +1984,63 @@ get_member_in :: (parent: *Node, ident: *Identifier) -> *Declaration {
     return decls[0];
 }
 
+get_struct_literal_type :: (literal: *Literal) -> *Node {
+    if literal.value_type != .STRUCT return null;
+
+    type_node := literal.values.struct_literal_info.type;
+
+    if !type_node && literal.parent {
+        if literal.parent.kind == {
+            case .DECLARATION;
+                decl := cast(*Declaration) literal.parent;
+                if decl.type_inst && decl.type_inst != literal {
+                    type_node = decl.type_inst;
+                }
+
+            case .PROCEDURE_CALL;
+                return get_argument_type_for_call(cast(*Procedure_Call) literal.parent, literal);
+
+            case .BINARY_OPERATION;
+                op := cast(*Binary_Operation) literal.parent;
+                if op.operation == .ASSIGN && op.right == literal {
+                    if op.parent && op.parent.kind == .PROCEDURE_CALL && op.left && op.left.kind == .IDENTIFIER {
+                        return get_argument_type_for_call(cast(*Procedure_Call) op.parent, op, cast(*Identifier, op.left).name);
+                    }
+
+                    if op.left {
+                        return get_node_type(op.left);
+                    }
+                }
+        }
+    }
+
+    if !type_node return null;
+
+    return get_node_type(type_node);
+}
+
+get_import_file :: (import: *Directive_Import) -> *Program_File {
+    path_without_filename := trim_right(path_strip_filename(import.location.file), "/");
+    path := get_module_import_path(import, path_without_filename);
+    if path.count == 0 {
+        return null;
+    }
+
+    return get_file(normalize_path(path,, temp));
+}
+
 get_members_in :: (parent: *Node, ident: *Identifier) -> []*Declaration {
     decls: [..]*Declaration;
 
     if parent.kind == .DIRECTIVE_IMPORT {
         import := cast(*Directive_Import) parent;
 
-        module_file_path := get_module_import_path(import, parent.location.file);
-        module_file := get_file(module_file_path);
-
+        module_file := get_import_file(import);
         if !module_file {
             return decls;
         }
 
-        return get_declarations(module_file, only_loaded=true, name=ident.name);
+        return get_declarations(module_file, only_loaded=true, name=ident.name, as_import=true);
     }
 
     // Special case for array
@@ -1397,39 +2076,33 @@ get_members_in :: (parent: *Node, ident: *Identifier) -> []*Declaration {
     return decls;
 }
 
-get_block_member_type :: (block: *Block, ident: *Identifier, solve_array := false) -> *Node {
+get_block_member_type :: (block: *Block, ident: *Identifier, array_depth := 0) -> *Node {
     decl := get_block_member(block, ident);
     if !decl {
         return null;
     }
 
-    return get_node_type(decl, solve_array);
+    return get_node_type(decl, array_depth);
 }
 
 get_block_member :: (block: *Block, ident: *Identifier) -> *Declaration {
     if !block return null;
-    if !enter_resolve() return null;
 
     for member: block.members {
         if member.kind == {
             case .UNION;
-                _union := cast(*Union)member;
+                found := get_block_member((cast(*Union) member).block, ident);
+                if found return found;
 
-                if _union.block {
-                    found := get_block_member(_union.block, ident);
-                    if found return found;
-                }
+            case .IF;
+                _if := cast(*If) member;
+
+                found := get_block_member(get_block_of(_if._then), ident);
+                if !found found = get_block_member(get_block_of(_if._else), ident);
+                if found return found;
             case .IDENTIFIER;
                 _ident := cast(*Identifier) member;
-                if _ident.name == ident.name {
-                    decl := New(Declaration); // @MEMORY: We should free this or it is temp?
-                    decl.name = _ident.name;
-                    decl.expression = *empty_identifier;
-                    decl.location = _ident.location;
-                    decl.const = true;
-
-                    return decl;
-                }
+                if _ident.name == ident.name return enum_member_declaration(_ident);
             case .DECLARATION;
                 decl := cast(*Declaration) member;
                 if decl.name == ident.name return xx member;
@@ -1485,17 +2158,6 @@ get_used_expression :: (node: *Node) -> *Node {
 
     _using := cast(*Using) unwrapped_node;
     return unwrap_as(_using.expression);
-}
-
-get_used_type :: (node: *Node) -> *Node {
-    used_expression := get_used_expression(node);
-    if !used_expression return null;
-
-    if used_expression.kind != .IDENTIFIER && used_expression.kind != .DECLARATION {
-        return null;
-    }
-
-    return get_node_type(used_expression);
 }
 
 get_last_binary_op :: (first: *Binary_Operation) -> *Binary_Operation {
@@ -1582,7 +2244,7 @@ get_path_type :: (path: []*Node, recursion_limit: s16 = 64) -> *Node {
             case .ARRAY_SUBSCRIPT; #through;
             case .IDENTIFIER;
                 identifier: *Identifier;
-                solve_array: bool = false;
+                array_depth: int = 0;
 
                 if node.kind == .IDENTIFIER {
                     identifier = cast(*Identifier) node;
@@ -1593,7 +2255,7 @@ get_path_type :: (path: []*Node, recursion_limit: s16 = 64) -> *Node {
                     }
 
                     identifier = cast(*Identifier) array_subscript.expression;
-                    solve_array = true;
+                    array_depth = 1;
                 } else if node.kind == .PROCEDURE_CALL {
                     proc_call := cast(*Procedure_Call) node;
                     if !proc_call.procedure || proc_call.procedure.kind != .IDENTIFIER {
@@ -1618,7 +2280,12 @@ get_path_type :: (path: []*Node, recursion_limit: s16 = 64) -> *Node {
                         return null;
                     }
 
-                    current_type = get_node_type(identifier, solve_array, select_first_non_procedure_decl);
+                    if node.kind == .PROCEDURE_CALL {
+                        current_type = get_node_type(node);
+                    } else {
+                        current_type = get_node_type(identifier, array_depth, select_first_non_procedure_decl);
+                    }
+
                     if !current_type {
                         break;
                     }
@@ -1633,27 +2300,23 @@ get_path_type :: (path: []*Node, recursion_limit: s16 = 64) -> *Node {
                         break;
                     }
 
-                    current_type = get_node_type(decl, solve_array);
+                    current_type = get_node_type(decl, array_depth);
                     resolved_nodes += 1;
                     continue;
                 }
 
-                if current_type.kind == .STRUCT {
-                    _struct := cast(*Struct, current_type);
-                    if !_struct.block {
-                        break;
-                    }
-
-                    type := get_block_member_type(_struct.block, identifier, solve_array);
-                    if !type {
-                        // log_error("Failed to get member type for %", identifier.name);
-                        break;
-                    }
-
-                    current_type = type;
-                    resolved_nodes += 1;
-                    continue;
+                if current_type.kind == .ARRAY_TYPE && identifier.name == "data" {
+                    array_type := cast(*Array_Type) current_type;
+                    current_type = get_node_type(array_type.element_type, max(0, array_depth - 1));
+                } else {
+                    decl := get_member_in(current_type, identifier);
+                    if !decl break;
+                    current_type = get_node_type(decl, array_depth);
                 }
+
+                if !current_type break;
+                resolved_nodes += 1;
+                continue;
 
             case .LITERAL;
                 current_type = node;
@@ -1666,7 +2329,7 @@ get_path_type :: (path: []*Node, recursion_limit: s16 = 64) -> *Node {
                         break;
                     }
 
-                    current_type = get_node_type(_unary_op.expression, true);
+                    current_type = get_node_type(_unary_op.expression, 1);
                     if !current_type {
                         break;
                     }
@@ -1686,7 +2349,7 @@ get_path_type :: (path: []*Node, recursion_limit: s16 = 64) -> *Node {
                     break;
                 }
 
-                current_type = get_node_type(cast_type, true);
+                current_type = get_node_type(cast_type, 1);
                 if !current_type {
                     return null;
                 }
@@ -1697,7 +2360,7 @@ get_path_type :: (path: []*Node, recursion_limit: s16 = 64) -> *Node {
         }
     }
 
-    if current_type && current_type.kind == .IDENTIFIER && current_type.location.file.data != null {
+    if current_type && current_type.kind == .IDENTIFIER && current_type.location.file.data != null && get_base_type_from_ident_or_literal(current_type) == .UNKNOWN {
         if path.count == 1 && path[0] == current_type {
             return null;
         }
@@ -1811,6 +2474,11 @@ get_best_overload_for_procedure_call :: (procedures: []*Procedure, call: *Proced
     current_best := 0;
     current_best_matched_args: u16 = 0;
 
+    call_arg_types := NewArray(call.arguments.count, *Node,, temp);
+    for call_arg, call_arg_index: call.arguments {
+        call_arg_types[call_arg_index] = get_node_type(call_arg);
+    }
+
     for procedure: procedures {
         matched_args: u16;
 
@@ -1821,7 +2489,7 @@ get_best_overload_for_procedure_call :: (procedures: []*Procedure, call: *Proced
         for call_arg, call_arg_index: call.arguments {
             arg := procedure.arguments[call_arg_index];
 
-            call_arg_type := get_node_type(call_arg);
+            call_arg_type := call_arg_types[call_arg_index];
             arg_type := get_node_type(arg);
 
             // log("Arg [%]: caller (% - %), calle (% - %)", arg_index, to_string(call_arg_type), call_arg_type.kind, to_string(arg_type), arg_type.kind);
@@ -1840,6 +2508,119 @@ get_best_overload_for_procedure_call :: (procedures: []*Procedure, call: *Proced
     }
 
     return current_best;
+}
+
+get_procedures_for_call :: (call: *Procedure_Call) -> []*Procedure {
+    procedures: [..]*Procedure;
+
+    if !call.procedure || call.procedure.kind != .IDENTIFIER {
+        return procedures;
+    }
+
+    proc_ident := cast(*Identifier) call.procedure;
+
+    proc_decls: [..]*Declaration;
+    defer array_free(proc_decls);
+
+    if call.parent && is_dot_binary_op(call.parent) {
+        path := get_dot_path(cast(*Binary_Operation) call.parent, call);
+        if path.count > 1 {
+            path = array_view(path, 0, path.count-1);
+            type := get_path_type(path);
+            if type {
+                array_add(*proc_decls, ..get_members_in(type, proc_ident));
+            }
+        }
+    } else {
+        array_add(*proc_decls, ..get_identifier_decls(proc_ident));
+    }
+
+    for proc_decl: proc_decls {
+        if !proc_decl continue;
+
+        type := get_node_type(proc_decl, stop_at_procedure=true);
+        if !type || type.kind != .PROCEDURE continue;
+
+        array_add(*procedures, cast(*Procedure) type);
+    }
+
+    return procedures;
+}
+
+get_procedure_argument :: (procedure: *Procedure, index: int, name := "") -> *Declaration {
+    if name.count > 0 {
+        for arg: procedure.arguments {
+            unwrapped := unwrap_polymorphic_constant(arg);
+            if !unwrapped || unwrapped.kind != .DECLARATION continue;
+
+            decl := cast(*Declaration) unwrapped;
+            if decl.name == name return decl;
+        }
+
+        return null;
+    }
+
+    if index < 0 || index >= procedure.arguments.count return null;
+
+    unwrapped := unwrap_polymorphic_constant(procedure.arguments[index]);
+    if !unwrapped || unwrapped.kind != .DECLARATION return null;
+
+    return cast(*Declaration) unwrapped;
+}
+
+get_call_argument_context :: (unary: *Unary_Operation) -> (call: *Procedure_Call, argument_node: *Node, argument_name: string) {
+    if unary.operation != .DOT || !unary.parent {
+        return null, null, "";
+    }
+
+    if unary.parent.kind == .PROCEDURE_CALL {
+        return cast(*Procedure_Call) unary.parent, unary, "";
+    }
+
+    if unary.parent.kind == .BINARY_OPERATION {
+        assign := cast(*Binary_Operation) unary.parent;
+        if assign.operation != .ASSIGN return null, null, "";
+        if !assign.left || assign.left.kind != .IDENTIFIER return null, null, "";
+        if !assign.parent || assign.parent.kind != .PROCEDURE_CALL return null, null, "";
+
+        return cast(*Procedure_Call) assign.parent, assign, cast(*Identifier, assign.left).name;
+    }
+
+    return null, null, "";
+}
+
+get_argument_type_for_call :: (call: *Procedure_Call, argument_node: *Node, argument_name := "") -> *Node {
+    procedures := get_procedures_for_call(call);
+    defer array_free(procedures);
+
+    if procedures.count == 0 {
+        return null;
+    }
+
+    argument_index := -1;
+    if argument_name.count == 0 {
+        for call.arguments {
+            if it == argument_node {
+                argument_index = it_index;
+                break;
+            }
+        }
+
+        if argument_index < 0 return null;
+    }
+
+    best := get_best_overload_for_procedure_call(procedures, call);
+    procedures[0], procedures[best] = procedures[best], procedures[0];
+
+    for procedures {
+        arg_decl := get_procedure_argument(it, argument_index, argument_name);
+        if !arg_decl continue;
+
+        type := get_node_type(arg_decl);
+        if type return type;
+    }
+
+    return null;
 }
 
 inside_comment :: (location: Node.Location) -> bool {
