@@ -37,6 +37,10 @@ Program_File :: struct {
     ast_pool_index: int;
 
     analysis_pool: Pool;
+
+    completion_pool: Pool;
+    completion_descriptions: Table(*Declaration, string);
+    completion_description_bytes: int;
 }
 
 Linked_File :: struct {
@@ -156,6 +160,23 @@ parse_into_file :: (file: *Program_File, content: string, path_without_filename:
     file.has_syntax_errors = parser.lexer.has_syntax_errors;
 }
 
+parse_local_module_for_file :: (file_path: string) {
+    for folder: server.local_modules {
+        root := folder;
+        if !is_absolute_path(root) root = join(server.project_root, root, separator="/",, temp);
+        root = normalize_path(root,, temp);
+        prefix := join(trim_right(root, "/"), "/",, temp);
+        if !begins_with(file_path, prefix) continue;
+
+        end := prefix.count;
+        while end < file_path.count && file_path[end] != #char "/" end += 1;
+        if end == file_path.count continue;
+
+        module_path := join(slice(file_path, 0, end), "module.jai", separator="/",, temp);
+        if file_exists(module_path) parse_file(module_path);
+    }
+}
+
 parse_file :: (input_path: string, force := false) {
     // Reset back to default allocator, we dont want to use pool from "parent" file...
     push_allocator(context.default_allocator);
@@ -170,10 +191,11 @@ parse_file :: (input_path: string, force := false) {
 
     // log("Parse file: %", path);
 
-    content := cast(string) get_memory_file(path);
+    memory_content, in_memory := get_memory_file(path);
+    content := cast(string) memory_content;
     content_from_file: bool;
 
-    if content.count == 0 {
+    if !in_memory {
         exists: bool;
 
         content, exists = read_entire_file(path, log_errors=false);
@@ -191,10 +213,16 @@ parse_file :: (input_path: string, force := false) {
         set_allocators(*file.ast_pools[0], context.default_allocator);
         set_allocators(*file.ast_pools[1], context.default_allocator);
         set_allocators(*file.analysis_pool, context.default_allocator);
+        set_allocators(*file.completion_pool, context.default_allocator);
         table_add(*server.files, file.path, file);
     }
 
     path_without_filename := normalize_path(trim_right(path_strip_filename(file.path), "/"));
+
+    release(*file.completion_pool);
+    file.completion_descriptions = .{};
+    file.completion_descriptions.allocator = pool_alloc(*file.completion_pool);
+    file.completion_description_bytes = 0;
 
     previous := file.ast;
     previous_index := file.ast_pool_index;
@@ -210,7 +238,7 @@ parse_file :: (input_path: string, force := false) {
         parse_into_file(file, content, path_without_filename);
     }
 
-    keep_previous := file.has_syntax_errors && !previous.has_syntax_errors && previous.nodes.count > 0;
+    keep_previous := file.has_syntax_errors && file.nodes.count == 0 && previous.nodes.count > 0;
 
     if keep_previous {
         file.ast = previous;
@@ -751,6 +779,7 @@ get_for_element_type :: (_for: *For) -> element_type: *Node, is_range: bool {
 
 get_declarations_from_for :: (decls: *[..]*Declaration, node: *Node, from_loc: *Node.Location, name := "") {
     _for := cast(*For) node;
+    if !_for.iterator || !_for.body || !from_loc || !contains(_for.body.location, from_loc.*) return;
 
     element_type, is_range := get_for_element_type(_for);
     if !element_type {
@@ -1208,35 +1237,57 @@ get_identifier_decls :: (ident: *Identifier) -> []*Declaration {
 resolve_dot_member :: (ident: *Identifier) -> decl: *Declaration, is_path: bool {
     if !ident || !ident.parent return null, false;
 
-    leaf_node: *Node;
+    leaf_node: *Node = ident;
     op: *Binary_Operation;
+    parent := leaf_node.parent;
+    while parent {
+        if parent.kind == {
+            case .BINARY_OPERATION;
+                binary := cast(*Binary_Operation) parent;
+                if binary.operation == .DOT {
+                    if binary.right == leaf_node {
+                        op = binary;
+                        break;
+                    }
+                }
+                if binary.left != leaf_node break;
 
-    if ident.parent.kind == {
-        case .BINARY_OPERATION;
-            op = cast(*Binary_Operation) ident.parent;
-            leaf_node = ident;
+            case .ARRAY_SUBSCRIPT;
+                if (cast(*Array_Subscript) parent).expression != leaf_node break;
 
-        case .ARRAY_SUBSCRIPT;
-            array_subscript := cast(*Array_Subscript) ident.parent;
-            if array_subscript.parent && array_subscript.parent.kind == .BINARY_OPERATION {
-                op = cast(*Binary_Operation) array_subscript.parent;
-                leaf_node = array_subscript;
-            }
+            case .PROCEDURE_CALL;
+                if (cast(*Procedure_Call) parent).procedure != leaf_node break;
 
-        case .PROCEDURE_CALL;
-            proc_call := cast(*Procedure_Call) ident.parent;
-            if proc_call.parent && proc_call.parent.kind == .BINARY_OPERATION {
-                op = cast(*Binary_Operation) proc_call.parent;
-                leaf_node = proc_call;
-            }
+            case .UNARY_OPERATION;
+                unary := cast(*Unary_Operation) parent;
+                if unary.operation != .POINTER_DEREFERENCE || unary.expression != leaf_node break;
+
+            case; break;
+        }
+        leaf_node = parent;
+        parent = parent.parent;
     }
 
     if !op return null, false;
 
-    path := get_dot_path(op, leaf_node);
-    if path.count < 2 return null, false;
+    receivers: [..]*Node;
+    child: *Node = op;
+    parent = op.parent;
+    while parent && parent.kind == .BINARY_OPERATION {
+        binary := cast(*Binary_Operation) parent;
+        if binary.operation == .DOT {
+            if binary.right != child break;
+            array_add(*receivers, binary.left);
+        } else if binary.left != child {
+            break;
+        }
+        child = parent;
+        parent = parent.parent;
+    }
 
-    path = array_view(path, 0, path.count-1);
+    path: [..]*Node;
+    for i: 0..receivers.count-1 append_completion_receiver_path(*path, receivers[receivers.count-1-i]);
+    append_completion_receiver_path(*path, op.left);
 
     type := get_path_type(path);
     if !type return null, true;
@@ -2254,22 +2305,18 @@ get_path_type :: (path: []*Node, recursion_limit: s16 = 64) -> *Node {
                     continue;
                 }
 
-                if current_type.kind == .STRUCT {
-                    _struct := cast(*Struct, current_type);
-                    if !_struct.block {
-                        break;
-                    }
-
-                    type := get_block_member_type(_struct.block, identifier, array_depth);
-                    if !type {
-                        // log_error("Failed to get member type for %", identifier.name);
-                        break;
-                    }
-
-                    current_type = type;
-                    resolved_nodes += 1;
-                    continue;
+                if current_type.kind == .ARRAY_TYPE && identifier.name == "data" {
+                    array_type := cast(*Array_Type) current_type;
+                    current_type = get_node_type(array_type.element_type, max(0, array_depth - 1));
+                } else {
+                    decl := get_member_in(current_type, identifier);
+                    if !decl break;
+                    current_type = get_node_type(decl, array_depth);
                 }
+
+                if !current_type break;
+                resolved_nodes += 1;
+                continue;
 
             case .LITERAL;
                 current_type = node;
@@ -2313,7 +2360,7 @@ get_path_type :: (path: []*Node, recursion_limit: s16 = 64) -> *Node {
         }
     }
 
-    if current_type && current_type.kind == .IDENTIFIER && current_type.location.file.data != null {
+    if current_type && current_type.kind == .IDENTIFIER && current_type.location.file.data != null && get_base_type_from_ident_or_literal(current_type) == .UNKNOWN {
         if path.count == 1 && path[0] == current_type {
             return null;
         }

@@ -1,64 +1,81 @@
+Memory_File :: struct {
+    path: string;
+    content: [..]u8;
+}
+
 init_memory_files :: () {
     init(*server.memory_files_lock);
+    server.memory_files.allocator = context.default_allocator;
 }
 
 deinit_memory_files :: () {
-    destroy(*server.memory_files_lock);
+    push_allocator(context.default_allocator);
+    for file: server.memory_files {
+        array_free(file.content);
+        free(file.path);
+    }
     deinit(*server.memory_files);
+    destroy(*server.memory_files_lock);
 }
 
 create_memory_file :: (file_path: string, content: string) {
-    content_dynamic: [..]u8;
-
-    array_copy(*content_dynamic, cast([]u8) content);
-    // free(content);
-
-    lock(*server.memory_files_lock);
-    defer unlock(*server.memory_files_lock);
-    table_set(*server.memory_files, copy_string(file_path), content_dynamic);
-}
-
-edit_memory_file :: (file_path: string, changes: []LSP_Content_Change) {
+    push_allocator(context.default_allocator);
     lock(*server.memory_files_lock);
     defer unlock(*server.memory_files_lock);
 
-    content := table_find_pointer(*server.memory_files, file_path);
-    if !content {
-        log_error("File is not in the cache %", file_path);
+    file := table_find_pointer(*server.memory_files, file_path);
+    if file {
+        replace_range(*file.content, 0, file.content.count, content);
         return;
     }
 
-    for change: changes {
-        if !change.range {
-            // Full document sync: the client sent the whole new text.
-            replace_range(content, 0, content.count, change.text);
-            continue;
-        }
-
-        apply_change(content, change.range.start, change.range.end, change.text);
-    }
+    new_file: Memory_File;
+    new_file.path = copy_string(file_path);
+    array_copy(*new_file.content, cast([]u8) content);
+    table_add(*server.memory_files, new_file.path, new_file);
 }
 
-remove_memory_file :: (file_path: string) {
+edit_memory_file :: (file_path: string, changes: []LSP_Content_Change) -> bool {
     lock(*server.memory_files_lock);
     defer unlock(*server.memory_files_lock);
 
-    ok, content := table_find(*server.memory_files, file_path);
-    if !ok return;
-    array_free(content);
-
-    found := table_remove(*server.memory_files, file_path);
-    if !found {
-        log_error("Tried to remove file % but it was not in the server.memory_files table!", file_path);
+    file := table_find_pointer(*server.memory_files, file_path);
+    if !file {
+        log_error("File is not in the cache %", file_path);
+        return false;
     }
+
+    changed := false;
+    for change: changes {
+        if !change.range {
+            // Full document sync: the client sent the whole new text.
+            changed = replace_range(*file.content, 0, file.content.count, change.text) || changed;
+            continue;
+        }
+
+        changed = apply_change(*file.content, change.range.start, change.range.end, change.text) || changed;
+    }
+    return changed;
+}
+
+remove_memory_file :: (file_path: string) {
+    push_allocator(context.default_allocator);
+    lock(*server.memory_files_lock);
+    defer unlock(*server.memory_files_lock);
+
+    found, file := table_remove(*server.memory_files, file_path);
+    if !found return;
+    array_free(file.content);
+    free(file.path);
 }
 
 find_line_in_memory_file :: (file: string, position: LSP_Position) -> string {
     lock(*server.memory_files_lock);
     defer unlock(*server.memory_files_lock);
 
-    ok, content := table_find(*server.memory_files, file);
+    ok, memory_file := table_find(*server.memory_files, file);
     if !ok return "";
+    content := memory_file.content;
 
     start := position_to_offset(content, .{line = position.line, character = 0});
 
@@ -75,16 +92,16 @@ is_memory_file :: (name: string) -> bool {
     return table_contains(*server.memory_files, name);
 }
 
-get_memory_file :: (name: string) -> []u8 {
+get_memory_file :: (name: string) -> content: []u8, found: bool {
     lock(*server.memory_files_lock);
     defer unlock(*server.memory_files_lock);
 
-    ok, content := table_find(*server.memory_files, name);
+    ok, file := table_find(*server.memory_files, name);
     if !ok {
-        return .[];
+        return .[], false;
     }
 
-    return content;
+    return file.content, true;
 }
 
 #scope_file
@@ -127,11 +144,13 @@ position_to_offset :: (content: []u8, position: LSP_Position) -> int {
     return offset;
 }
 
-replace_range :: (content: *[..]u8, start: int, end: int, text: string) {
+replace_range :: (content: *[..]u8, start: int, end: int, text: string) -> bool {
     if start < 0 || start > end || end > content.count {
         log_error("replace_range: invalid range [%, %) for a document of % bytes, ignoring the edit.", start, end, content.count);
-        return;
+        return false;
     }
+
+    if end - start == text.count && slice(cast(string) content.*, start, text.count) == text return false;
 
     old_count := content.count;
     removed   := end - start;
@@ -158,9 +177,10 @@ replace_range :: (content: *[..]u8, start: int, end: int, text: string) {
     }
 
     content.count = new_count;
+    return true;
 }
 
-apply_change :: (content: *[..]u8, from: LSP_Position, to: LSP_Position, text: string) {
+apply_change :: (content: *[..]u8, from: LSP_Position, to: LSP_Position, text: string) -> bool {
     start_index := position_to_offset(content.*, from);
     end_index   := position_to_offset(content.*, to);
 
@@ -170,5 +190,5 @@ apply_change :: (content: *[..]u8, from: LSP_Position, to: LSP_Position, text: s
         end_index = tmp;
     }
 
-    replace_range(content, start_index, end_index, text);
+    return replace_range(content, start_index, end_index, text);
 }

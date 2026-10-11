@@ -29,7 +29,7 @@ Server :: struct {
     files_to_be_analyzed: [..]*Program_File;
 
     memory_files_lock: Mutex;
-    memory_files: Table(string, [..]u8); // @todo: This is probably dumb - store files as array of lines instead (is this good idea?) // @ToDo: Keep track of a modified flag per file
+    memory_files: Table(string, Memory_File);
 
     diagnostics_metaprogram_path: string;
 
@@ -413,8 +413,10 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
 
             file_path := normalize_path(body.params.textDocument.uri,, temp);
 
-            parse_file(file_path, true);
-            analyze_files();
+            if !is_memory_file(file_path) {
+                parse_file(file_path, true);
+                analyze_files();
+            }
 
         case "textDocument/didOpen";
             success, body := json_parse_string(raw_request, LSP_Did_Open_Text_Document,, temp);
@@ -430,6 +432,7 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             create_memory_file(file_path, content);
 
             parse_file(file_path, true);
+            parse_local_module_for_file(file_path);
             analyze_files();
             // run_diagnostics();
 
@@ -443,9 +446,10 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             }
 
             file_path := normalize_path(body.params.textDocument.uri,, temp);
-            edit_memory_file(file_path, body.params.contentChanges);
-            parse_file(file_path, true);
-            analyze_files();
+            if edit_memory_file(file_path, body.params.contentChanges) {
+                parse_file(file_path, true);
+                analyze_files();
+            }
 
         case "textDocument/documentSymbol";
             success, body := json_parse_string(raw_request, LSP_Request_Message_Document_Symbol,, temp);
@@ -552,6 +556,7 @@ main :: () {
     log("Args are %", server.args);
 
     defer deinit(*server.files);
+    defer for file: server.files release(*file.completion_pool);
 
     server.files_to_be_analyzed.allocator = context.default_allocator;
 
@@ -564,6 +569,7 @@ main :: () {
     start_parent_watchdog();
 
     while !server.quit {
+        defer reset_temporary_storage();
         body, success, closed := read_message_from_stdin(,, temp);
         if closed {
             // The editor closed our stdin. Without this we would spin here forever at 100% CPU.
@@ -585,12 +591,11 @@ main :: () {
 
         handle_request(request, body);
 
-        reset_temporary_storage();
         #if MEMORY_DEBUG report_memory_leaks();
     }
 
     log("Shutdown");
-    exit(0);
+    return;
 }
 
 #import "Compiler";

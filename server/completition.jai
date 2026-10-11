@@ -208,6 +208,11 @@ handle_dot_completitions :: (request: LSP_Request_Message_Completion, cursor_nod
     op: *Binary_Operation;
     search_node := cursor_node;
     while search_node {
+        if search_node.kind == .PROCEDURE_CALL {
+            call := cast(*Procedure_Call) search_node;
+            if !call.procedure || !contains(call.procedure.location, cursor_location) return false;
+        }
+
         if search_node == cursor_node && is_dot_binary_op(search_node) {
             op = cast(*Binary_Operation) search_node;
             break;
@@ -517,18 +522,47 @@ completion_kind_for_declaration :: (decl: *Declaration) -> LSP_Completion_Item.K
     return .Variable;
 }
 
+MAX_COMPLETION_DESCRIPTION_ENTRIES :: 128;
+MAX_COMPLETION_DESCRIPTION_BYTES :: 64 * 1024;
+
+completion_description :: (decl: *Declaration, preview_node: *Node) -> string {
+    push_allocator(temp);
+
+    file := get_file(decl.location.file);
+    if file {
+        found, description := table_find(*file.completion_descriptions, decl);
+        if found return description;
+    }
+
+    builder: String_Builder;
+    ast_print(*builder, preview_node);
+    description := builder_to_string(*builder);
+
+    if !file || file.completion_descriptions.count >= MAX_COMPLETION_DESCRIPTION_ENTRIES return description;
+    if description.count > MAX_COMPLETION_DESCRIPTION_BYTES - file.completion_description_bytes return description;
+
+    owned := false;
+    for candidate: table_find_multiple(*file.declarations, decl.name) {
+        if candidate == decl {
+            owned = true;
+            break;
+        }
+    }
+    if !owned return description;
+
+    push_allocator(pool_alloc(*file.completion_pool));
+    stored := copy_string(description);
+    table_add(*file.completion_descriptions, decl, stored);
+    file.completion_description_bytes += stored.count;
+    return stored;
+}
+
 send_completions_decls :: (request: LSP_Request_Message_Completion, decls: []*Declaration, should_add_basic_keywords := false, prefix := "", members := false) {
     completions: [..]LSP_Completion_Item;
     defer array_free(completions);
 
     if should_add_basic_keywords {
         add_builtin_completions(*completions, prefix);
-    }
-
-    ast_print_to_string :: (node: *Node) -> string {
-        builder: String_Builder;
-        ast_print(*builder, node); // @Memory @TODO: we need to free this afterwards!!
-        return builder_to_string(*builder);
     }
 
     filter_by_prefix := prefix.count > 0 && (members || decls.count > MAX_COMPLETIONS);
@@ -567,7 +601,7 @@ send_completions_decls :: (request: LSP_Request_Message_Completion, decls: []*De
                     item.insertText = sprint("%($0)", decl.name);
                 }
 
-                item.labelDetails.description = ast_print_to_string(preview_node);
+                item.labelDetails.description = completion_description(decl, preview_node);
 
             case .STRUCT;
                 item.labelDetails.description = "struct";
@@ -579,7 +613,7 @@ send_completions_decls :: (request: LSP_Request_Message_Completion, decls: []*De
                 item.labelDetails.description = "enum";
 
             case;
-                item.labelDetails.description = ast_print_to_string(preview_node);
+                item.labelDetails.description = completion_description(decl, preview_node);
         }
 
         array_add(*completions, item);

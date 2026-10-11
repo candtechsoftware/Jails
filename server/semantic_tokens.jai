@@ -70,9 +70,10 @@ handle_semantic_tokens :: (id: JSON_Value, uri: string) {
 
     file_path := normalize_path(uri);
     file := get_file(file_path);
-    content := cast(string) get_memory_file(file_path);
+    memory_content, found := get_memory_file(file_path);
+    content := cast(string) memory_content;
 
-    if !file || file.tokens.count == 0 || content.count == 0 {
+    if !found || !file || file.tokens.count == 0 || content.count == 0 {
         lsp_respond(id, null);
         return;
     }
