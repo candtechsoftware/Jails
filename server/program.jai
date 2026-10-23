@@ -21,6 +21,8 @@ Parsed_Ast :: struct {
     tokens: [..]Token;
     global_members: []*Node;
     has_syntax_errors: bool;
+    nodes_at: Table(u64, *Node);
+    nodes_at_built: bool;
 }
 
 Program_File :: struct {
@@ -108,16 +110,20 @@ search_for_file :: (name: string) -> *Program_File {
 }
 
 normalize_path :: (path: string) -> string {
-    normalized_path := decode_url(path);
+    parsed: Path;
+    {
+        push_allocator(temp);
+        normalized_path := decode_url(path);
 
-    #if OS == .WINDOWS {
-        normalized_path = replace(normalized_path, "file:///", "");
-        path_overwrite_separators(normalized_path, #char "/");
-    } else {
-        normalized_path = replace(normalized_path, "file://", "");
+        #if OS == .WINDOWS {
+            normalized_path = replace(normalized_path, "file:///", "");
+            path_overwrite_separators(normalized_path, #char "/");
+        } else {
+            normalized_path = replace(normalized_path, "file://", "");
+        }
+
+        parsed = parse_path(normalized_path, reduce=true);
     }
-
-    parsed := parse_path(normalized_path, reduce=true);
     return path_to_string(parsed);
 }
 
@@ -126,8 +132,7 @@ normalize_and_copy_path :: (path: string) -> string {
         return "";
     }
 
-    str := normalize_path(path);
-    return copy_string(str);
+    return normalize_path(path);
 }
 
 path_to_lsp_path :: (path: string) -> string {
@@ -177,11 +182,11 @@ parse_local_module_for_file :: (file_path: string) {
     }
 }
 
-parse_file :: (input_path: string, force := false) {
+parse_file :: (input_path: string, force := false, clear_if_missing := false) {
     // Reset back to default allocator, we dont want to use pool from "parent" file...
     push_allocator(context.default_allocator);
 
-    path := normalize_path(input_path);
+    path := normalize_path(input_path,, temp);
 
     ok, file := table_find(*server.files, path);
     if !force && ok {
@@ -200,11 +205,11 @@ parse_file :: (input_path: string, force := false) {
 
         content, exists = read_entire_file(path, log_errors=false);
         if !exists {
-            // log_error("File % does not exists!", path);
-            return;
+            if !clear_if_missing || !ok return;
+            content = "";
         }
 
-        content_from_file = true;
+        content_from_file = exists;
     }
 
     if !ok {
@@ -217,7 +222,7 @@ parse_file :: (input_path: string, force := false) {
         table_add(*server.files, file.path, file);
     }
 
-    path_without_filename := normalize_path(trim_right(path_strip_filename(file.path), "/"));
+    path_without_filename := normalize_path(trim_right(path_strip_filename(file.path), "/"),, temp);
 
     release(*file.completion_pool);
     file.completion_descriptions = .{};
@@ -278,7 +283,6 @@ parse_harvested_types :: (sources: []string, context_path: string) -> Table(u64,
     types: Table(u64, *Struct);
 
     release(*server.harvest_pool);
-    set_allocators(*server.harvest_pool, context.default_allocator);
     table_reset(*server.harvested_decls);
 
     if sources.count == 0 return types;
@@ -356,7 +360,6 @@ analyze_files :: () {
     }
 
     release(*server.context_pool);
-    set_allocators(*server.context_pool, context.default_allocator);
     server.context_struct = null;
     server.context_struct_built = false;
 

@@ -482,6 +482,8 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
 
             file_path := normalize_path(body.params.textDocument.uri,, temp);
             remove_memory_file(file_path);
+            parse_file(file_path, true, clear_if_missing=true);
+            analyze_files();
 
         case "textDocument/semanticTokens/full";
             success, body := json_parse_string(raw_request, LSP_Request_Message_Semantic_Tokens,, temp);
@@ -559,6 +561,8 @@ main :: () {
     defer for file: server.files release(*file.completion_pool);
 
     server.files_to_be_analyzed.allocator = context.default_allocator;
+    set_allocators(*server.context_pool, context.default_allocator);
+    set_allocators(*server.harvest_pool, context.default_allocator);
 
     init_memory_files();
     defer deinit_memory_files();

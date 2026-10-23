@@ -1,6 +1,8 @@
 Memory_File :: struct {
     path: string;
     content: [..]u8;
+    line_starts: [..]int;
+    line_starts_valid: bool;
 }
 
 init_memory_files :: () {
@@ -12,6 +14,7 @@ deinit_memory_files :: () {
     push_allocator(context.default_allocator);
     for file: server.memory_files {
         array_free(file.content);
+        array_free(file.line_starts);
         free(file.path);
     }
     deinit(*server.memory_files);
@@ -25,7 +28,7 @@ create_memory_file :: (file_path: string, content: string) {
 
     file := table_find_pointer(*server.memory_files, file_path);
     if file {
-        replace_range(*file.content, 0, file.content.count, content);
+        if replace_range(*file.content, 0, file.content.count, content) file.line_starts_valid = false;
         return;
     }
 
@@ -47,13 +50,15 @@ edit_memory_file :: (file_path: string, changes: []LSP_Content_Change) -> bool {
 
     changed := false;
     for change: changes {
+        edited: bool;
         if !change.range {
             // Full document sync: the client sent the whole new text.
-            changed = replace_range(*file.content, 0, file.content.count, change.text) || changed;
-            continue;
+            edited = replace_range(*file.content, 0, file.content.count, change.text);
+        } else {
+            edited = apply_change(file, change.range.start, change.range.end, change.text);
         }
-
-        changed = apply_change(*file.content, change.range.start, change.range.end, change.text) || changed;
+        if edited file.line_starts_valid = false;
+        changed = edited || changed;
     }
     return changed;
 }
@@ -66,6 +71,7 @@ remove_memory_file :: (file_path: string) {
     found, file := table_remove(*server.memory_files, file_path);
     if !found return;
     array_free(file.content);
+    array_free(file.line_starts);
     free(file.path);
 }
 
@@ -73,16 +79,25 @@ find_line_in_memory_file :: (file: string, position: LSP_Position) -> string {
     lock(*server.memory_files_lock);
     defer unlock(*server.memory_files_lock);
 
-    ok, memory_file := table_find(*server.memory_files, file);
-    if !ok return "";
+    memory_file := table_find_pointer(*server.memory_files, file);
+    if !memory_file return "";
+    ensure_line_starts(memory_file);
     content := memory_file.content;
+    if position.line >= memory_file.line_starts.count return "";
+    start := memory_file.line_starts[position.line];
+    stop := ifx position.line + 1 < memory_file.line_starts.count then memory_file.line_starts[position.line + 1] - 1 else content.count;
+    return slice(cast(string) content, start, stop - start);
+}
 
-    start := position_to_offset(content, .{line = position.line, character = 0});
+// Borrowed until the next document mutation, like get_memory_file's content.
+get_memory_file_line_starts :: (name: string) -> []int {
+    lock(*server.memory_files_lock);
+    defer unlock(*server.memory_files_lock);
 
-    stop := start;
-    while stop < content.count && content[stop] != #char "\n" stop += 1;
-
-    return to_string(content.data + start, stop - start);
+    file := table_find_pointer(*server.memory_files, name);
+    if !file return .[];
+    ensure_line_starts(file);
+    return file.line_starts;
 }
 
 is_memory_file :: (name: string) -> bool {
@@ -129,20 +144,22 @@ byte_column_to_utf16_column :: (line: string, column: int) -> int {
 
 #scope_file
 
-position_to_offset :: (content: []u8, position: LSP_Position) -> int {
-    offset := 0;
-    line := 0;
-
-    while line < position.line && offset < content.count {
-        if content[offset] == #char "\n" line += 1;
-        offset += 1;
+ensure_line_starts :: (file: *Memory_File) {
+    if file.line_starts_valid return;
+    push_allocator(context.default_allocator);
+    array_reset(*file.line_starts);
+    array_add(*file.line_starts, 0);
+    for byte, index: file.content {
+        if byte == #char "\n" array_add(*file.line_starts, index + 1);
     }
+    file.line_starts_valid = true;
+}
 
-    if line < position.line {
-        return content.count; // The document has fewer lines than requested.
-    }
-
-    return offset + utf16_column_to_byte_column(slice(cast(string) content, offset, content.count - offset), position.character);
+position_to_offset :: (file: *Memory_File, position: LSP_Position) -> int {
+    ensure_line_starts(file);
+    if position.line >= file.line_starts.count return file.content.count;
+    offset := file.line_starts[position.line];
+    return offset + utf16_column_to_byte_column(slice(cast(string) file.content, offset, file.content.count - offset), position.character);
 }
 
 replace_range :: (content: *[..]u8, start: int, end: int, text: string) -> bool {
@@ -181,9 +198,9 @@ replace_range :: (content: *[..]u8, start: int, end: int, text: string) -> bool 
     return true;
 }
 
-apply_change :: (content: *[..]u8, from: LSP_Position, to: LSP_Position, text: string) -> bool {
-    start_index := position_to_offset(content.*, from);
-    end_index   := position_to_offset(content.*, to);
+apply_change :: (file: *Memory_File, from: LSP_Position, to: LSP_Position, text: string) -> bool {
+    start_index := position_to_offset(file, from);
+    end_index   := position_to_offset(file, to);
 
     if end_index < start_index {
         tmp := start_index;
@@ -191,5 +208,5 @@ apply_change :: (content: *[..]u8, from: LSP_Position, to: LSP_Position, text: s
         end_index = tmp;
     }
 
-    return replace_range(content, start_index, end_index, text);
+    return replace_range(*file.content, start_index, end_index, text);
 }

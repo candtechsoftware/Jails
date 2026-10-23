@@ -80,45 +80,37 @@ handle_semantic_tokens :: (id: JSON_Value, uri: string) {
 
     emitter: Token_Emitter;
     emitter.content = content;
-    emitter.line_starts = build_line_starts(content);
+    emitter.line_starts = get_memory_file_line_starts(file_path);
     array_reserve(*emitter.data, file.tokens.count * 5);
 
-    nodes_at := build_nodes_at(file);
-    collect_semantic_tokens(*emitter, *nodes_at, file);
+    nodes_at := get_nodes_at(file);
+    collect_semantic_tokens(*emitter, nodes_at, file);
 
     lsp_respond(id, LSP_Semantic_Tokens.{data = emitter.data});
-}
-
-build_line_starts :: (content: string) -> []int {
-    starts: [..]int;
-    array_add(*starts, 0);
-
-    for index: 0..content.count-1 {
-        if content[index] == #char "\n" array_add(*starts, index + 1);
-    }
-
-    return starts;
 }
 
 node_position_key :: (line: int, character: int) -> u64 {
     return ((cast(u64) line) << 32) | ((cast(u64) character) & 0xFFFF_FFFF);
 }
 
-build_nodes_at :: (file: *Program_File) -> Table(u64, *Node) {
-    nodes_at: Table(u64, *Node);
-    table_resize(*nodes_at, file.nodes.count);
+get_nodes_at :: (file: *Program_File) -> *Table(u64, *Node) {
+    if file.nodes_at_built return *file.nodes_at;
+    push_allocator(pool_alloc(*file.ast_pools[file.ast_pool_index]));
+    nodes_at := *file.nodes_at;
+    table_resize(nodes_at, file.nodes.count);
 
     for node: file.nodes {
         key := node_position_key(node.location.l0, node.location.c0);
 
         if node.kind == .DECLARATION {
-            if (cast(*Declaration) node).name.count > 0 table_set(*nodes_at, key, node);
+            if (cast(*Declaration) node).name.count > 0 table_set(nodes_at, key, node);
         } else if node.kind == .IDENTIFIER {
-            entry, is_new := find_or_add(*nodes_at, key);
+            entry, is_new := find_or_add(nodes_at, key);
             if is_new entry.* = node;
         }
     }
 
+    file.nodes_at_built = true;
     return nodes_at;
 }
 
