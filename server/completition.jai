@@ -44,7 +44,11 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
             handle_completitions_load(request, file, xx cursor_node);
             return;
         }
+    }
 
+    if handle_struct_literal_completions(request, file, cursor_location) return;
+
+    if cursor_node {
         if handle_dot_completitions(request, cursor_node, cursor_location) {
             return;
         }
@@ -77,8 +81,122 @@ handle_completitions :: (request: LSP_Request_Message_Completion) {
     }
 
     // General
-    decls := get_declarations(file, cursor_node, *cursor_location);
-    send_completions_decls(request, decls, should_add_basic_keywords=true, prefix=prefix);
+    local_count: int;
+    decls := get_declarations(file, cursor_node, *cursor_location, local_count=*local_count);
+    send_completions_decls(request, decls, should_add_basic_keywords=true, prefix=prefix, local_count=local_count);
+}
+
+Literal_Completion_Frame :: struct {
+    opening: int;
+    entry_start: int;
+}
+
+// Tokens retain the entry boundary even when the cursor is in whitespace or
+// the literal has no closing brace yet. Never inspect nested expressions as
+// though their identifiers were field names of the surrounding literal.
+handle_struct_literal_completions :: (request: LSP_Request_Message_Completion, file: *Program_File, cursor_location: Node.Location) -> bool {
+    cursor := cursor_location;
+
+    frames: [..]Literal_Completion_Frame;
+    next_index := 0;
+    for token, index: file.tokens {
+        if token.l0 > cursor.l0 || (token.l0 == cursor.l0 && token.c0 >= cursor.c0) break;
+        next_index = index + 1;
+        if token.kind == .BEGIN_STRUCT_LITERAL || token.kind == .BEGIN_ARRAY_LITERAL || token.kind == #char "{" || token.kind == #char "[" || token.kind == #char "(" {
+            array_add(*frames, .{index, index + 1});
+        } else if token.kind == #char "}" || token.kind == #char "]" || token.kind == #char ")" {
+            if frames.count > 0 frames.count -= 1;
+        } else if token.kind == #char "," && frames.count > 0 {
+            frames[frames.count - 1].entry_start = index + 1;
+        }
+    }
+
+    if frames.count == 0 return false;
+    frame := frames[frames.count - 1];
+    begin := file.tokens[frame.opening];
+    if begin.kind != .BEGIN_STRUCT_LITERAL return false;
+
+    name_token: *Token;
+    for index: frame.entry_start..next_index-1 {
+        token := *file.tokens[index];
+        if name_token || token.kind != .IDENTIFIER return false;
+        name_token = token;
+    }
+
+    // Include the complete identifier when completing at its start or middle.
+    if !name_token && next_index < file.tokens.count {
+        token := *file.tokens[next_index];
+        if token.kind == .IDENTIFIER && token.l0 == cursor.l0 && token.c0 == cursor.c0 name_token = token;
+    }
+    if name_token && (name_token.l0 != cursor.l0 || name_token.l1 != cursor.l0 || cursor.c0 > name_token.c1) return false;
+
+    begin_location := Node.Location.{l0=begin.l0, c0=begin.c0, l1=begin.l0, c1=begin.c0, file=file.path};
+    literal: *Literal;
+    for node: file.nodes {
+        if node.kind != .LITERAL continue;
+        candidate := cast(*Literal) node;
+        if candidate.value_type != .STRUCT || !contains(candidate.location, begin_location) continue;
+        if !literal || contains(literal.location, candidate.location) literal = candidate;
+    }
+    if !literal return false;
+
+    type := get_struct_literal_type(literal);
+    if !type {
+        lsp_respond(request.id, null);
+        return true;
+    }
+
+    prefix := "";
+    edit_range: LSP_Range;
+    edit_range.start = request.params.position;
+    edit_range.end = request.params.position;
+    lookahead := next_index;
+    if name_token {
+        prefix = slice(name_token.string_value, 0, min(cursor.c0 - name_token.c0, name_token.string_value.count));
+        name_location := Node.Location.{l0=name_token.l0, c0=name_token.c0, l1=name_token.l1, c1=name_token.c1, file=file.path};
+        edit_range = node_location_to_lsp_location(name_location).range;
+        if lookahead < file.tokens.count && *file.tokens[lookahead] == name_token lookahead += 1;
+    }
+    has_assignment := lookahead < file.tokens.count && file.tokens[lookahead].kind == #char "=";
+
+    excluded: Table(string, bool);
+    for entry: literal.values.struct_literal_info.body {
+        if entry.kind != .BINARY_OPERATION continue;
+        op := cast(*Binary_Operation) entry;
+        if op.operation != .ASSIGN || !op.left || op.left.kind != .IDENTIFIER continue;
+        ident := cast(*Identifier) op.left;
+        if name_token && ident.location.l0 == name_token.l0 && ident.location.c0 == name_token.c0 continue;
+        table_set(*excluded, ident.name, true);
+    }
+
+    decls: [..]*Declaration;
+    add_all_fields_of(*decls, type);
+    completions: [..]LSP_Completion_Item;
+    truncated := false;
+    for decl: decls {
+        if decl.const || (!decl.type_inst && !decl.expression) continue;
+        if !begins_with(decl.name, prefix) || table_contains(*excluded, decl.name) continue;
+        if completions.count >= MAX_COMPLETIONS {
+            truncated = true;
+            break;
+        }
+
+        item: LSP_Completion_Item;
+        item.label = decl.name;
+        item.kind = xx LSP_Completion_Item.Kind.Field;
+        item.sortText = tprint("%", formatInt(completions.count, minimum_digits=5));
+        item.insertText = ifx has_assignment then decl.name else tprint("% = ", decl.name);
+        item.textEdit = New(LSP_Text_Edit);
+        item.textEdit.range = edit_range;
+        item.textEdit.newText = item.insertText;
+        preview := ifx decl.type_inst then decl.type_inst else decl.expression;
+        item.labelDetails.description = completion_description(decl, preview);
+        array_add(*completions, item);
+        table_set(*excluded, decl.name, true);
+    }
+
+    lsp_respond(request.id, LSP_Completion_List.{isIncomplete=truncated, items=completions});
+    return true;
 }
 
 // handle_completitions_procedure_call :: (request: LSP_Request_Message_Completion, file: *Program_File, cursor_node: *Node, cursor_location: *Node.Location) -> bool {
@@ -344,7 +462,12 @@ handle_assignment_completitions :: (request: LSP_Request_Message_Completion, cur
         return false;
     }
 
-    left_type := get_node_type(op, 1);
+    left_type: *Node;
+    if op.parent && op.parent.kind == .LITERAL {
+        left_type = get_expected_type(cursor_node);
+    } else {
+        left_type = get_node_type(op, 1);
+    }
     if !left_type {
         return false;
     }
@@ -487,19 +610,25 @@ get_completion_prefix :: (file_path: string, cursor_location: Node.Location) -> 
     return slice(line, start, end - start), after_dot;
 }
 
-add_builtin_completions :: (completions: *[..]LSP_Completion_Item, prefix: string) {
-    add :: (completions: *[..]LSP_Completion_Item, names: []string, kind: LSP_Completion_Item.Kind) {
-        for names array_add(completions, .{label = it, sortText = it, insertText = it, kind = xx kind});
+add_builtin_completions :: (completions: *[..]LSP_Completion_Item, prefix: string, seen: *Table(string, *Declaration), filter_by_prefix: bool) -> truncated: bool {
+    add :: (completions: *[..]LSP_Completion_Item, names: []string, kind: LSP_Completion_Item.Kind, prefix: string, seen: *Table(string, *Declaration), filter_by_prefix: bool) -> bool {
+        for names {
+            if table_contains(seen, it) continue;
+            if filter_by_prefix && !begins_with(it, prefix) continue;
+            if completions.count >= MAX_COMPLETIONS return true;
+            array_add(completions, .{label=it, sortText=tprint("3_%", it), insertText=it, kind=xx kind});
+            table_set(seen, it, null);
+        }
+        return false;
     }
 
     if prefix.count > 0 && prefix[0] == #char "#" {
-        add(completions, BUILTIN_DIRECTIVES, .Keyword);
-        return;
+        return add(completions, BUILTIN_DIRECTIVES, .Keyword, prefix, seen, filter_by_prefix);
     }
 
-    add(completions, BUILTIN_TYPE_NAMES, .Keyword);
-    add(completions, BUILTIN_KEYWORDS, .Keyword);
-    add(completions, BUILTIN_PROCEDURES, .Function);
+    if add(completions, BUILTIN_TYPE_NAMES, .Keyword, prefix, seen, filter_by_prefix) return true;
+    if add(completions, BUILTIN_KEYWORDS, .Keyword, prefix, seen, filter_by_prefix) return true;
+    return add(completions, BUILTIN_PROCEDURES, .Function, prefix, seen, filter_by_prefix);
 }
 
 completion_kind_for_declaration :: (decl: *Declaration) -> LSP_Completion_Item.Kind {
@@ -557,66 +686,93 @@ completion_description :: (decl: *Declaration, preview_node: *Node) -> string {
     return stored;
 }
 
-send_completions_decls :: (request: LSP_Request_Message_Completion, decls: []*Declaration, should_add_basic_keywords := false, prefix := "", members := false) {
+completion_declarations_are_overloads :: (a: *Declaration, b: *Declaration) -> bool {
+    if !a || !b || a == b return false;
+    if a.parent != b.parent || a.location.file != b.location.file return false;
+    if !a.const || !b.const || !a.expression || !b.expression return false;
+    return a.expression.kind == .PROCEDURE && b.expression.kind == .PROCEDURE;
+}
+
+send_completions_decls :: (request: LSP_Request_Message_Completion, decls: []*Declaration, should_add_basic_keywords := false, prefix := "", members := false, local_count := 0) {
     completions: [..]LSP_Completion_Item;
     defer array_free(completions);
-
-    if should_add_basic_keywords {
-        add_builtin_completions(*completions, prefix);
-    }
-
+    seen: Table(string, *Declaration);
+    file_path := normalize_path(request.params.textDocument.uri);
     filter_by_prefix := prefix.count > 0 && (members || decls.count > MAX_COMPLETIONS);
     truncated := false;
 
-    for decl: decls {
-        if !decl.expression && !decl.type_inst continue;
-        if filter_by_prefix && !begins_with(decl.name, prefix) continue;
+    // Keep lexical scope order for locals, then current-file declarations,
+    // then linked files. Member completion keeps its existing declaration order.
+    for scope_rank: 0..2 {
+        if members && scope_rank > 0 break;
+        for decl, decl_index: decls {
+            if !members {
+                rank := ifx decl_index < local_count then 0 else ifx decl.location.file == file_path then 1 else 2;
+                if rank != scope_rank continue;
+                found, nearest := table_find(*seen, decl.name);
+                if found && !completion_declarations_are_overloads(nearest, decl) continue;
+            }
+            if !decl.expression && !decl.type_inst continue;
+            if filter_by_prefix && !begins_with(decl.name, prefix) continue;
 
-        if completions.count >= MAX_COMPLETIONS {
-            truncated = true;
-            break;
+            if completions.count >= MAX_COMPLETIONS {
+                truncated = true;
+                break;
+            }
+
+            preview_node: *Node;
+            if decl.expression {
+                preview_node = decl.expression;
+            } else {
+                preview_node = decl.type_inst;
+            }
+
+            item: LSP_Completion_Item;
+            item.label = decl.name;
+            if members {
+                item.sortText = tprint("%", formatInt(completions.count, minimum_digits=5));
+            } else if scope_rank == 0 {
+                item.sortText = tprint("0_%", formatInt(decl_index, minimum_digits=10));
+            } else {
+                item.sortText = tprint("%_%", scope_rank, decl.name);
+            }
+            item.insertText = decl.name;
+            item.insertTextFormat = xx LSP_Completion_Item.Insert_Text_Format.SNIPPET;
+            item.kind = xx completion_kind_for_declaration(decl);
+
+            if preview_node.kind == {
+                case .PROCEDURE;
+                    procedure := cast(*Procedure) preview_node;
+                    item.deprecated = procedure.deprecated_note.count > 0;
+
+                    if server.user_options.auto_insert_parentheses {
+                        item.insertText = sprint("%($0)", decl.name);
+                    }
+
+                    item.labelDetails.description = completion_description(decl, preview_node);
+
+                case .STRUCT;
+                    item.labelDetails.description = "struct";
+
+                case .UNION;
+                    item.labelDetails.description = "union";
+
+                case .ENUM;
+                    item.labelDetails.description = "enum";
+
+                case;
+                    item.labelDetails.description = completion_description(decl, preview_node);
+            }
+
+            array_add(*completions, item);
+            table_set(*seen, decl.name, decl);
         }
+        if truncated break;
+    }
 
-        preview_node: *Node;
-        if decl.expression {
-            preview_node = decl.expression;
-        } else {
-            preview_node = decl.type_inst;
-        }
-
-        item: LSP_Completion_Item;
-        item.label = decl.name;
-        item.sortText = decl.name;
-        if members item.sortText = tprint("%", formatInt(completions.count, minimum_digits=5));
-        item.insertText = decl.name;
-        item.insertTextFormat = xx LSP_Completion_Item.Insert_Text_Format.SNIPPET;
-        item.kind = xx completion_kind_for_declaration(decl);
-
-        if preview_node.kind == {
-            case .PROCEDURE;
-                procedure := cast(*Procedure) preview_node;
-                item.deprecated = procedure.deprecated_note.count > 0;
-
-                if server.user_options.auto_insert_parentheses {
-                    item.insertText = sprint("%($0)", decl.name);
-                }
-
-                item.labelDetails.description = completion_description(decl, preview_node);
-
-            case .STRUCT;
-                item.labelDetails.description = "struct";
-
-            case .UNION;
-                item.labelDetails.description = "union";
-
-            case .ENUM;
-                item.labelDetails.description = "enum";
-
-            case;
-                item.labelDetails.description = completion_description(decl, preview_node);
-        }
-
-        array_add(*completions, item);
+    if should_add_basic_keywords {
+        builtins_truncated := add_builtin_completions(*completions, prefix, *seen, filter_by_prefix);
+        truncated = truncated || builtins_truncated;
     }
 
     lsp_respond(request.id, LSP_Completion_List.{

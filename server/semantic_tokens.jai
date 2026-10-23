@@ -219,6 +219,9 @@ emit_span :: (emitter: *Token_Emitter, l0: int, c0: int, l1: int, c1: int, type:
 
         if end <= start continue;
 
+        line_content := slice(emitter.content, line_start, length);
+        start = byte_column_to_utf16_column(line_content, start);
+        end = byte_column_to_utf16_column(line_content, end);
         delta_line := line - emitter.previous_line;
         delta_character := ifx delta_line == 0 then start - emitter.previous_character else start;
 

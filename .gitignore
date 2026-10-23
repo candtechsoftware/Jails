@@ -3,6 +3,9 @@ node_modules/
 out/
 *.vsix
 
+# Python regression runner
+__pycache__/
+
 # Jai
 .build/
 bin/

@@ -3,7 +3,8 @@ Jails is an experimental language server for the Jai programming language.
 
 ## Features
 - Basic Go-To Definition
-- Autocomplete for available symbols (types, procedures etc)
+- Autocomplete for available symbols (types, procedures etc), prioritizing nearby locals and parameters before globals and built-ins
+- Struct-literal field completion, hover and Go-To Definition for `value: Type = .{...}` and `value := Type.{...}`, including nested named fields and enum values
 - Signature help for procedure calls
 - Error reporting from the compiler
 
@@ -36,6 +37,9 @@ This repo uses git submodules. Clone it using `git clone --recurse-submodules`.
 
 ### Building
 Compile the release version of the server with `jai build.jai - -release`. Jails binary will be generated in the `bin` folder.
+
+### Testing struct literals
+Build with `jai build.jai`, then run `python3 tests/struct_literals.py`. The regression runner tests the server over LSP using a temporary workspace and in-memory documents. Set `JAI_PATH` if the compiler is not on your path, or `JAILS_SERVER` to test a different server binary.
 
 ### VS Code
 Jails for VS Code can be downloaded from [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=ApparentlyStudio.jails) or you can build it yourself. The prebuilt version supports x64 Windows and ARM64 MacOS at the moment.

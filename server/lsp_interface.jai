@@ -513,7 +513,7 @@ LSP_Result_Initialize :: struct {
         }
 
         completionProvider: struct {
-            triggerCharacters := string.[".", ":", "=", "\"", "#", "/"];
+            triggerCharacters := string.[".", ":", "=", "\"", "#", "/", "{", ","];
         };
 
         textDocumentSync: struct {
@@ -612,6 +612,7 @@ LSP_Completion_Item :: struct {
     sortText: string;
     detail: string;
     insertText: string;
+    textEdit: *LSP_Text_Edit;
     documentation: string;
     deprecated: bool;
 

@@ -104,6 +104,29 @@ get_memory_file :: (name: string) -> content: []u8, found: bool {
     return file.content, true;
 }
 
+// The parser uses byte columns, while LSP uses UTF-16 code units.
+utf16_column_to_byte_column :: (line: string, column: int) -> int {
+    offset := 0;
+    units := 0;
+    while offset < line.count && units < column && line[offset] != #char "\n" {
+        byte := line[offset];
+        width := ifx byte >= 0xF0 then 4 else ifx byte >= 0xE0 then 3 else ifx byte >= 0xC0 then 2 else 1;
+        units += ifx width == 4 then 2 else 1;
+        offset += width;
+    }
+    return min(offset, line.count);
+}
+
+byte_column_to_utf16_column :: (line: string, column: int) -> int {
+    units := 0;
+    for index: 0..clamp(column, 0, line.count)-1 {
+        byte := line[index];
+        if (byte & 0xC0) == 0x80 continue;
+        units += ifx byte >= 0xF0 then 2 else 1;
+    }
+    return units;
+}
+
 #scope_file
 
 position_to_offset :: (content: []u8, position: LSP_Position) -> int {
@@ -119,29 +142,7 @@ position_to_offset :: (content: []u8, position: LSP_Position) -> int {
         return content.count; // The document has fewer lines than requested.
     }
 
-    units: int;
-    while offset < content.count && units < position.character {
-        byte := content[offset];
-        if byte == #char "\n" break;
-
-        sequence_length := 1;
-        if byte >= 0xF0 {
-            sequence_length = 4;
-        } else if byte >= 0xE0 {
-            sequence_length = 3;
-        } else if byte >= 0xC0 {
-            sequence_length = 2;
-        }
-
-        units += ifx sequence_length == 4 then 2 else 1;
-        offset += sequence_length;
-    }
-
-    if offset > content.count {
-        offset = content.count;
-    }
-
-    return offset;
+    return offset + utf16_column_to_byte_column(slice(cast(string) content, offset, content.count - offset), position.character);
 }
 
 replace_range :: (content: *[..]u8, start: int, end: int, text: string) -> bool {

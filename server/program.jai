@@ -964,12 +964,13 @@ ensure_global_scope :: (file: *Program_File) -> bool {
     return true;
 }
 
-get_declarations :: (file: *Program_File, from_node: *Node = null, from_loc: *Node.Location = null, name := "", only_loaded := false, as_import := false) -> []*Declaration {
+get_declarations :: (file: *Program_File, from_node: *Node = null, from_loc: *Node.Location = null, name := "", only_loaded := false, as_import := false, local_count: *int = null) -> []*Declaration {
     decls: [..]*Declaration;
 
     if from_node {
         get_declarations_from_parent(*decls, from_node, from_loc, name, false);
     }
+    if local_count local_count.* = decls.count;
 
     // Globals in all linked files (loaded or imported)
     if file {
@@ -1212,6 +1213,11 @@ lsp_location_to_node_location :: (location: LSP_Position, file := "") -> Node.Lo
     node_location.c0 = location.character;
     node_location.l1 = location.line;
     node_location.c1 = location.character;
+    if is_memory_file(file) {
+        line := find_line_in_memory_file(file, location);
+        node_location.c0 = utf16_column_to_byte_column(line, location.character);
+        node_location.c1 = node_location.c0;
+    }
     return node_location;
 }
 
@@ -1222,6 +1228,12 @@ node_location_to_lsp_location :: (location: Node.Location) -> LSP_Location {
     lsp_location.range.start.character = xx location.c0;
     lsp_location.range.end.line = xx location.l1;
     lsp_location.range.end.character = xx location.c1;
+    if is_memory_file(location.file) {
+        start_line := find_line_in_memory_file(location.file, lsp_location.range.start);
+        end_line := find_line_in_memory_file(location.file, lsp_location.range.end);
+        lsp_location.range.start.character = xx byte_column_to_utf16_column(start_line, location.c0);
+        lsp_location.range.end.character = xx byte_column_to_utf16_column(end_line, location.c1);
+    }
     return lsp_location;
 }
 
@@ -1261,6 +1273,10 @@ resolve_dot_member :: (ident: *Identifier) -> decl: *Declaration, is_path: bool 
             case .UNARY_OPERATION;
                 unary := cast(*Unary_Operation) parent;
                 if unary.operation != .POINTER_DEREFERENCE || unary.expression != leaf_node break;
+
+            case .LITERAL;
+                literal := cast(*Literal) parent;
+                if literal.value_type != .STRUCT || literal.values.struct_literal_info.type != leaf_node break;
 
             case; break;
         }
@@ -1306,13 +1322,15 @@ resolve_named_member :: (ident: *Identifier) -> *Declaration {
     if !ident.parent || ident.parent.kind != .BINARY_OPERATION return null;
 
     binary_op := cast(*Binary_Operation) ident.parent;
-    if binary_op.right == ident || !binary_op.parent return null;
+    if binary_op.operation != .ASSIGN || binary_op.left != ident || !binary_op.parent return null;
 
     if binary_op.parent.kind == .PROCEDURE_CALL {
-        for get_procedures_for_call(cast(*Procedure_Call) binary_op.parent) {
-            decl := get_procedure_argument(it, -1, ident.name);
-            if decl return decl;
-        }
+        call := cast(*Procedure_Call) binary_op.parent;
+        procedures := get_procedures_for_call(call);
+        defer array_free(procedures);
+        if procedures.count == 0 return null;
+        best := get_best_overload_for_procedure_call(procedures, call);
+        return get_procedure_argument(procedures[best], -1, ident.name);
     }
 
     if binary_op.parent.kind == .LITERAL {
@@ -1329,10 +1347,12 @@ resolve_implicit_member :: (ident: *Identifier) -> *Declaration {
     unary_op := cast(*Unary_Operation) ident.parent;
     if unary_op.operation != .DOT || !unary_op.parent return null;
 
-    type: *Node;
-    call, argument_node, argument_name := get_call_argument_context(unary_op);
-    if call type = get_argument_type_for_call(call, argument_node, argument_name);
-    if !type && unary_op.parent.kind == .BINARY_OPERATION type = get_node_type(unary_op.parent, 1);
+    type := get_expected_type(unary_op);
+    if !type && unary_op.parent.kind == .BINARY_OPERATION {
+        op := cast(*Binary_Operation) unary_op.parent;
+        // A literal field must never fall back to a same-named scope variable.
+        if !op.parent || op.parent.kind != .LITERAL type = get_node_type(op, 1);
+    }
     if !type return null;
 
     return get_member_in(type, ident);
@@ -1368,9 +1388,23 @@ resolve_procedure_call :: (ident: *Identifier) -> *Declaration {
 }
 
 resolve_cursor_declaration :: (ident: *Identifier) -> decl: *Declaration, handled: bool {
+    if ident.parent && ident.parent.kind == .UNARY_OPERATION {
+        unary := cast(*Unary_Operation) ident.parent;
+        if unary.operation == .DOT return resolve_implicit_member(ident), true;
+    }
+
+    if ident.parent && ident.parent.kind == .BINARY_OPERATION {
+        op := cast(*Binary_Operation) ident.parent;
+        if op.operation == .ASSIGN && op.left == ident && op.parent {
+            if op.parent.kind == .PROCEDURE_CALL return resolve_named_member(ident), true;
+            if op.parent.kind == .LITERAL {
+                literal := cast(*Literal) op.parent;
+                if literal.value_type == .STRUCT return resolve_named_member(ident), true;
+            }
+        }
+    }
+
     decl := resolve_enum_member_declaration(ident);
-    if !decl decl = resolve_named_member(ident);
-    if !decl decl = resolve_implicit_member(ident);
     if decl return decl, true;
 
     dot_member, is_dot_path := resolve_dot_member(ident);
@@ -1684,19 +1718,7 @@ get_node_type :: (root: *Node, array_depth := 0, select_decl := select_first_dec
 
             if literal.value_type == {
                 case .STRUCT;
-                    struct_literal_info := literal.values.struct_literal_info;
-                    if struct_literal_info.type {
-                        current_node = struct_literal_info.type;
-                        continue;
-                    }
-
-                    if literal.parent && literal.parent.kind == .DECLARATION {
-                        decl := cast(*Declaration) literal.parent;
-                        if decl.type_inst && decl.type_inst != literal {
-                            current_node = decl.type_inst;
-                            continue;
-                        }
-                    }
+                    return get_struct_literal_type(literal);
 
                 case .ARRAY;
                     array_literal_info := literal.values.array_literal_info;
@@ -1984,39 +2006,64 @@ get_member_in :: (parent: *Node, ident: *Identifier) -> *Declaration {
     return decls[0];
 }
 
-get_struct_literal_type :: (literal: *Literal) -> *Node {
-    if literal.value_type != .STRUCT return null;
+// The expected type of an initializer or value expression, independent of its
+// own inferred type. In particular, a field name is not a lexical identifier.
+get_expected_type :: (node: *Node) -> *Node {
+    if !node || !node.parent return null;
+    if !enter_resolve() return null;
 
-    type_node := literal.values.struct_literal_info.type;
+    parent := node.parent;
+    if parent.kind == {
+        case .DECLARATION;
+            decl := cast(*Declaration) parent;
+            if decl.expression == node && decl.type_inst && decl.type_inst != node return get_node_type(decl.type_inst);
 
-    if !type_node && literal.parent {
-        if literal.parent.kind == {
-            case .DECLARATION;
-                decl := cast(*Declaration) literal.parent;
-                if decl.type_inst && decl.type_inst != literal {
-                    type_node = decl.type_inst;
+        case .PROCEDURE_CALL;
+            return get_argument_type_for_call(cast(*Procedure_Call) parent, node);
+
+        case .BINARY_OPERATION;
+            op := cast(*Binary_Operation) parent;
+            if op.operation == .ASSIGN && op.right == node {
+                if op.parent && op.parent.kind == .PROCEDURE_CALL && op.left && op.left.kind == .IDENTIFIER {
+                    return get_argument_type_for_call(cast(*Procedure_Call) op.parent, op, cast(*Identifier, op.left).name);
                 }
 
-            case .PROCEDURE_CALL;
-                return get_argument_type_for_call(cast(*Procedure_Call) literal.parent, literal);
-
-            case .BINARY_OPERATION;
-                op := cast(*Binary_Operation) literal.parent;
-                if op.operation == .ASSIGN && op.right == literal {
-                    if op.parent && op.parent.kind == .PROCEDURE_CALL && op.left && op.left.kind == .IDENTIFIER {
-                        return get_argument_type_for_call(cast(*Procedure_Call) op.parent, op, cast(*Identifier, op.left).name);
-                    }
-
-                    if op.left {
-                        return get_node_type(op.left);
-                    }
+                if op.parent && op.parent.kind == .LITERAL {
+                    literal := cast(*Literal) op.parent;
+                    if literal.value_type != .STRUCT || !op.left || op.left.kind != .IDENTIFIER return null;
+                    type := get_struct_literal_type(literal);
+                    if !type return null;
+                    field := get_member_in(type, cast(*Identifier) op.left);
+                    if !field return null;
+                    return get_node_type(field);
                 }
-        }
+
+                if op.left {
+                    return get_node_type(op.left);
+                }
+            }
     }
 
-    if !type_node return null;
+    return null;
+}
 
-    return get_node_type(type_node);
+get_struct_literal_type :: (literal: *Literal) -> *Node {
+    if literal.value_type != .STRUCT return null;
+    if !enter_resolve() return null;
+
+    type_node := literal.values.struct_literal_info.type;
+    if type_node {
+        if is_dot_binary_op(literal.parent) {
+            dot := cast(*Binary_Operation) literal.parent;
+            if dot.right == literal {
+                path := get_dot_path(dot, literal);
+                path[path.count - 1] = type_node;
+                return get_path_type(path);
+            }
+        }
+        return get_node_type(type_node);
+    }
+    return get_expected_type(literal);
 }
 
 get_import_file :: (import: *Directive_Import) -> *Program_File {
@@ -2087,6 +2134,7 @@ get_block_member_type :: (block: *Block, ident: *Identifier, array_depth := 0) -
 
 get_block_member :: (block: *Block, ident: *Identifier) -> *Declaration {
     if !block return null;
+    if !enter_resolve() return null;
 
     for member: block.members {
         if member.kind == {
@@ -2106,6 +2154,11 @@ get_block_member :: (block: *Block, ident: *Identifier) -> *Declaration {
             case .DECLARATION;
                 decl := cast(*Declaration) member;
                 if decl.name == ident.name return xx member;
+
+            case .COMPOUND_DECLARATION;
+                decls: [..]*Declaration;
+                compound_declaration_to_declarations(*decls, cast(*Compound_Declaration) member, ident.name);
+                if decls.count > 0 return decls[0];
 
             case .DIRECTIVE_AS; #through;
             case .USING;
@@ -2476,7 +2529,18 @@ get_best_overload_for_procedure_call :: (procedures: []*Procedure, call: *Proced
 
     call_arg_types := NewArray(call.arguments.count, *Node,, temp);
     for call_arg, call_arg_index: call.arguments {
-        call_arg_types[call_arg_index] = get_node_type(call_arg);
+        value := call_arg;
+        if value.kind == .BINARY_OPERATION {
+            op := cast(*Binary_Operation) value;
+            if op.operation == .ASSIGN && op.right value = op.right;
+        }
+        if value.kind == .LITERAL {
+            literal := cast(*Literal) value;
+            // Its type depends on choosing the overload. Inferring it here
+            // would recursively select this same overload using its own result.
+            if literal.value_type == .STRUCT && !literal.values.struct_literal_info.type continue;
+        }
+        call_arg_types[call_arg_index] = get_node_type(value);
     }
 
     for procedure: procedures {
@@ -2487,14 +2551,24 @@ get_best_overload_for_procedure_call :: (procedures: []*Procedure, call: *Proced
         }
 
         for call_arg, call_arg_index: call.arguments {
-            arg := procedure.arguments[call_arg_index];
-
             call_arg_type := call_arg_types[call_arg_index];
+            name := "";
+            if call_arg.kind == .BINARY_OPERATION {
+                op := cast(*Binary_Operation) call_arg;
+                if op.operation == .ASSIGN && op.left && op.left.kind == .IDENTIFIER name = (cast(*Identifier) op.left).name;
+            }
+            arg := get_procedure_argument(procedure, call_arg_index, name);
+            if !arg {
+                matched_args = 0;
+                break call_arg;
+            }
+            // A contextual literal has no independent type to score. Other
+            // arguments can still distinguish the overload, regardless of order.
+            if !call_arg_type continue;
             arg_type := get_node_type(arg);
 
-            // log("Arg [%]: caller (% - %), calle (% - %)", arg_index, to_string(call_arg_type), call_arg_type.kind, to_string(arg_type), arg_type.kind);
-
             if !is_same_type(arg_type, call_arg_type) {
+                matched_args = 0;
                 break call_arg;
             }
 
@@ -2719,7 +2793,12 @@ compound_declaration_to_declarations :: (decls: *[..]*Declaration, comp_decl: *C
         decl.parent = comp_item_ident.parent;
         decl.location = comp_item_ident.location;
         decl.name = comp_item_ident.name;
-        decl.expression = item_expr;
+        if comp_decl.type_inst && comp_decl.type_inst.type_inst && !comp_decl.type_inst.expression {
+            decl.type_inst = item_expr;
+        } else {
+            decl.expression = item_expr;
+        }
+        if comp_decl.type_inst decl.const = comp_decl.type_inst.const;
 
         array_add(decls, decl);
     }
